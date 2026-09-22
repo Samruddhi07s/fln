@@ -6,6 +6,7 @@ import { getAuthUser, canAccessStudent } from '../auth';
 import { generateDiagnosticPaper } from '../paperGenerator';
 import { generateQuestionsForLevel } from '../levelGenerator';
 import { evaluateAIDiagnostic } from '../gemini';
+import { runCertificationEligibility } from '../services/certificationRecords';
 import { invalidateFingerprintCache } from './misconceptions';
 import { assignStudentToArchetype } from '../studentArchetypeService';
 import { resolvePrerequisites, describeConcept, directPrerequisites } from '../competencyPrerequisites';
@@ -711,12 +712,12 @@ export function registerStudentRoutes(app: express.Express) {
       const startLevel = (classNumber - 1) * 12 + 1;
       questions = [];
       for (let lvl = startLevel; lvl < startLevel + 8; lvl++) {
-        const lvlQuestions = generateQuestionsForLevel(Math.min(lvl, 93), 0);
+        const lvlQuestions = generateQuestionsForLevel(Math.min(lvl, 108), 0);
         lvlQuestions.forEach(q => {
           questions.push({
             ...q,
             question_id: `DIAG_${lvl}_${q.question_id}`,
-            source_level: Math.min(lvl, 93)
+            source_level: Math.min(lvl, 108)
           });
         });
       }
@@ -1428,6 +1429,9 @@ export function registerStudentRoutes(app: express.Express) {
     } catch (error) {
       console.error('[archetype] Failed to assign student to misconception archetype:', error);
     }
+
+    // Fire-and-forget: re-evaluate certification eligibility.
+    runCertificationEligibility(student);
 
     await dbStore.addLog({
       id: 'log_' + Date.now(),
