@@ -42,11 +42,8 @@ import { registerQuestionLogicRoutes } from './routes/questionLogics';
 import { registerQuestionTemplateRoutes } from './routes/questionTemplates';
 import { registerQuestionOptionRoutes } from './routes/questionOptions';
 import { registerDiagnosticBulkRoutes } from './routes/diagnosticBulk';
-<<<<<<< HEAD
 import { registerScanRoutes } from './routes/scans';
-=======
 import { registerCertificationRoutes } from './routes/certification';
->>>>>>> upstream/main
 import { registerMisconceptionRoutes } from './routes/misconceptions';
 import { registerCurriculumRoutes } from './routes/curriculum';
 import { registerQuestionBankRoutes } from './routes/questionBank';
@@ -259,11 +256,8 @@ registerStatsRoutes(app);
   registerQuestionTemplateRoutes(app);
   registerQuestionOptionRoutes(app);
   registerDiagnosticBulkRoutes(app);
-<<<<<<< HEAD
   registerScanRoutes(app);
-=======
   registerCertificationRoutes(app);
->>>>>>> upstream/main
 
   // Read-only analysis over already-graded submissions: clusters a cohort on
   // HOW its children fail rather than how much they score.
