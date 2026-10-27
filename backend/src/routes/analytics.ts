@@ -7,10 +7,182 @@ export function registerAnalyticsRoutes(app: express.Express) {
     const user = getAuthUser(req);
     if (!user) return res.status(401).json({ error: 'Unauthorized' });
 
-    // Query params for dynamic filtering
-    const stateCodeParam = (req.query.stateCode as string) || user.stateCode || 'PB';
-    const districtCodeParam = (req.query.districtCode as string) || user.districtCode || 'LDH';
-    const blockCodeParam = (req.query.blockCode as string) || user.blockCode || 'LDH-01';
+    const role = user.role;
+
+    // Institutional roles (Principal/School, Teacher, Volunteer) are strictly school-scoped
+    const isInstitutional =
+      role === UserRole.SCHOOL ||
+      (role as string) === 'school' ||
+      (role as string) === 'principal' ||
+      role === UserRole.TEACHER ||
+      role === UserRole.VOLUNTEER;
+
+    if (isInstitutional) {
+      const assignedSchools: string[] = role === UserRole.VOLUNTEER
+        ? (Array.isArray(user.assignedSchools) && user.assignedSchools.length > 0
+            ? user.assignedSchools
+            : (user.schoolId ? [user.schoolId] : []))
+        : (user.schoolId
+            ? [user.schoolId]
+            : (Array.isArray(user.assignedSchools) && user.assignedSchools.length > 0 ? user.assignedSchools : []));
+
+      const schoolId = user.schoolId || (assignedSchools.length === 1 ? assignedSchools[0] : (assignedSchools.length > 0 ? assignedSchools.join(',') : ''));
+      const hasSchools = assignedSchools.length > 0;
+
+      const [
+        schoolAnalytics,
+        totalStudents,
+        totalSchools,
+        totalWorksheets,
+        certifiedCount,
+        totalReports
+      ] = await Promise.all([
+        hasSchools
+          ? dbStore.getAnalyticsForScope(
+              assignedSchools.length === 1
+                ? { id: assignedSchools[0] }
+                : { id: { $in: assignedSchools } }
+            )
+          : {
+              avgLevel: 0,
+              certificationRate: 0,
+              topicMastery: {},
+              levelDistribution: {},
+              count: 0
+            },
+        // Total students count across assigned schools
+        (async () => {
+          if (!hasSchools) return 0;
+          if (dbStore.getDb()) {
+            return await dbStore.getDb()!.collection('students').countDocuments({ schoolId: { $in: assignedSchools } });
+          }
+          return ((dbStore as any).data?.students || []).filter((s: any) => assignedSchools.includes(s.schoolId)).length;
+        })(),
+        assignedSchools.length,
+        // Worksheets count scoped to schools
+        (async () => {
+          if (!hasSchools) return 0;
+          if (dbStore.getDb()) {
+            return await dbStore.getDb()!.collection('worksheets').countDocuments({ schoolId: { $in: assignedSchools } });
+          }
+          return ((dbStore as any).data?.worksheets || []).filter((w: any) => assignedSchools.includes(w.schoolId)).length;
+        })(),
+        // Certified students count (currentLevel >= 5) across assigned schools
+        (async () => {
+          if (!hasSchools) return 0;
+          if (dbStore.getDb()) {
+            return await dbStore.getDb()!.collection('students').countDocuments({
+              schoolId: { $in: assignedSchools },
+              currentLevel: { $gte: 5 }
+            });
+          }
+          return ((dbStore as any).data?.students || []).filter(
+            (s: any) => assignedSchools.includes(s.schoolId) && (s.currentLevel || 0) >= 5
+          ).length;
+        })(),
+        // Reports count scoped to assigned schools
+        (async () => {
+          if (!hasSchools) return 0;
+          if (dbStore.getDb()) {
+            const studentIds = (await dbStore.getDb()!.collection('students').find(
+              { schoolId: { $in: assignedSchools } },
+              { projection: { id: 1 } }
+            ).toArray()).map((s: any) => s.id);
+            if (studentIds.length === 0) return 0;
+            return await dbStore.getDb()!.collection('evaluationReports').countDocuments({ studentId: { $in: studentIds } });
+          }
+          const studentIds = ((dbStore as any).data?.students || [])
+            .filter((s: any) => assignedSchools.includes(s.schoolId))
+            .map((s: any) => s.id);
+          return ((dbStore as any).data?.evaluationReports || [])
+            .filter((r: any) => studentIds.includes(r.studentId)).length;
+        })(),
+      ]);
+
+      const certificationPercent = totalStudents > 0 ? Math.round((certifiedCount / totalStudents) * 100) : (schoolAnalytics?.certificationRate || 0);
+
+      const pipeline = {
+        conducted: totalWorksheets * 10,
+        scanned: totalReports,
+        evaluated: totalReports,
+        certified: certifiedCount
+      };
+
+      return res.json({
+        totalStudents,
+        totalSchools,
+        totalWorksheets,
+        certificationPercent,
+        pipeline,
+        roleScope: role,
+        schoolId,
+        school: schoolAnalytics,
+        national: null,
+        state: null,
+        district: null,
+        block: null
+      });
+    }
+
+    // Role-based scoping for Administrative roles
+    let stateCodeParam = '';
+    let districtCodeParam = '';
+    let blockCodeParam = '';
+
+    if (role === UserRole.SUPERADMIN) {
+      stateCodeParam = (req.query.stateCode as string) || user.stateCode || '';
+      districtCodeParam = (req.query.districtCode as string) || user.districtCode || '';
+      blockCodeParam = (req.query.blockCode as string) || user.blockCode || '';
+    } else if (role === UserRole.ADMIN) {
+      // State admin: strictly locked to user.stateCode, can query sub-districts and blocks within state
+      stateCodeParam = user.stateCode || '';
+      districtCodeParam = (req.query.districtCode as string) || user.districtCode || '';
+      blockCodeParam = (req.query.blockCode as string) || user.blockCode || '';
+    } else if (role === UserRole.DISTRICT_ADMIN) {
+      // District admin: strictly locked to user.stateCode and user.districtCode, can query sub-blocks
+      stateCodeParam = user.stateCode || '';
+      districtCodeParam = user.districtCode || '';
+      blockCodeParam = (req.query.blockCode as string) || user.blockCode || '';
+    } else if (role === UserRole.BLOCK_ADMIN) {
+      // Block admin: strictly locked to user.stateCode, user.districtCode, and user.blockCode
+      stateCodeParam = user.stateCode || '';
+      districtCodeParam = user.districtCode || '';
+      blockCodeParam = user.blockCode || '';
+    } else {
+      stateCodeParam = user.stateCode || '';
+      districtCodeParam = user.districtCode || '';
+      blockCodeParam = user.blockCode || '';
+    }
+
+    // Fail closed: an admin whose own area is missing must not fall through to unscoped data.
+    const missingScope =
+      (role === UserRole.ADMIN && !user.stateCode) ||
+      (role === UserRole.DISTRICT_ADMIN && (!user.stateCode || !user.districtCode)) ||
+      (role === UserRole.BLOCK_ADMIN && (!user.stateCode || !user.districtCode || !user.blockCode));
+    if (missingScope) {
+      return res.json({
+        totalStudents: 0,
+        totalSchools: 0,
+        totalWorksheets: 0,
+        certificationPercent: 0,
+        pipeline: { conducted: 0, scanned: 0, evaluated: 0, certified: 0 },
+        roleScope: role,
+        national: null,
+        state: null,
+        district: null,
+        block: null,
+      });
+    }
+
+    const stateFilter = stateCodeParam ? { stateCode: stateCodeParam } : undefined;
+    const districtFilter = districtCodeParam
+      ? (stateCodeParam ? { stateCode: stateCodeParam, districtCode: districtCodeParam } : { districtCode: districtCodeParam })
+      : undefined;
+    const blockFilter = blockCodeParam
+      ? (districtCodeParam
+          ? (stateCodeParam ? { stateCode: stateCodeParam, districtCode: districtCodeParam, blockCode: blockCodeParam } : { districtCode: districtCodeParam, blockCode: blockCodeParam })
+          : (stateCodeParam ? { stateCode: stateCodeParam, blockCode: blockCodeParam } : { blockCode: blockCodeParam }))
+      : undefined;
 
     // Calculate dynamic scopes using fast aggregation pipelines
     const [
@@ -24,12 +196,12 @@ export function registerAnalyticsRoutes(app: express.Express) {
       certifiedCount,
       totalReports,
     ] = await Promise.all([
-      dbStore.getAnalyticsForScope(),
-      dbStore.getAnalyticsForScope({ stateCode: stateCodeParam }),
-      dbStore.getAnalyticsForScope({ districtCode: districtCodeParam }),
-      dbStore.getAnalyticsForScope({ blockCode: blockCodeParam }),
-      dbStore.countStudentsFast(),
-      dbStore.countSchoolsFast(),
+      role === UserRole.SUPERADMIN ? dbStore.getAnalyticsForScope() : null,
+      stateFilter ? dbStore.getAnalyticsForScope(stateFilter) : null,
+      districtFilter ? dbStore.getAnalyticsForScope(districtFilter) : null,
+      blockFilter ? dbStore.getAnalyticsForScope(blockFilter) : null,
+      dbStore.countStudentsFast(role === UserRole.SUPERADMIN ? undefined : (user.schoolId ? { schoolId: user.schoolId } : undefined)),
+      dbStore.countSchoolsFast(stateFilter || {}),
       // Worksheets count
       (async () => {
         if (dbStore.getDb()) {
@@ -37,7 +209,7 @@ export function registerAnalyticsRoutes(app: express.Express) {
         }
         return (dbStore as any).data?.worksheets?.length || 0;
       })(),
-      dbStore.countStudentsFast({ currentLevelMin: 5 }),
+      dbStore.countStudentsFast(role === UserRole.SUPERADMIN ? { currentLevelMin: 5 } : (user.schoolId ? { schoolId: user.schoolId, currentLevelMin: 5 } : { currentLevelMin: 5 })),
       // Reports count
       dbStore.countReports(),
     ]);
@@ -75,7 +247,7 @@ export function registerAnalyticsRoutes(app: express.Express) {
   app.get('/api/analytics/superadmin', async (req, res) => {
     const user = getAuthUser(req);
     if (!user) return res.status(401).json({ error: 'Unauthorized' });
-    if (user.role !== UserRole.SUPERADMIN && user.role !== UserRole.ADMIN) {
+    if (user.role !== UserRole.SUPERADMIN) {
       return res.status(403).json({ error: 'Forbidden: Superadmin access required.' });
     }
 
@@ -105,6 +277,7 @@ export function registerAnalyticsRoutes(app: express.Express) {
         totalStudents,
         certifiedCount,
         studentsBySchool,
+        schoolEvaluationStats,
         userCounts,
         reportStats,
         totalUsers,
@@ -120,6 +293,7 @@ export function registerAnalyticsRoutes(app: express.Express) {
         dbStore.countStudentsFast(),
         dbStore.countStudentsFast({ currentLevelMin: 5 }),
         dbStore.getSchoolStudentCounts(),
+        dbStore.getSchoolEvaluationStats(),
         dbStore.countUsersByRole(),
         dbStore.countReportsByOutcome(),
         // users count for the KPI tile
@@ -233,26 +407,41 @@ export function registerAnalyticsRoutes(app: express.Express) {
         cumulative: Math.min(totalSchools, Math.round(perMonth * (i + 1))),
       }));
 
-      // School rankings: real filtered schools with computed metrics from
-      // studentsBySchool map (no scan needed).
+      // Percentage with an explicit zero-denominator guard, matching the
+      // guarded arithmetic used above (certifiedPercent, passPercent). A
+      // school with no enrolled students has no completion rate and a school
+      // with no evaluation reports has no pass rate; both report 0 rather
+      // than NaN or Infinity.
+      const percentOf = (numerator: number, denominator: number) =>
+        denominator > 0 ? Math.round((numerator / denominator) * 100) : 0;
+
       const schoolRankings = allFilteredSchools.map((sch: any) => {
         const schId = sch.id || sch._id;
-        const totalStud = studentsBySchool.get(schId) || 0;
-        const schStudents = totalStud; // could re-query if we need per-school avg
+        const stats = schoolEvaluationStats.get(schId) || {
+          students: 0, assessedStudents: 0, reports: 0, passed: 0,
+        };
         return {
-          rank: 0,
           id: schId,
           name: sch.name,
           stateCode: sch.stateCode,
           schoolType: sch.schoolType || 'Government',
-          performanceScore: schStudents > 0 ? Math.round((schStudents / 108) * 100) : 0,
-          completionRate: 0,
-          studentSatisfaction: 0,
-          interviewSuccessRate: 0,
+          // Share of the school's roster that has actually been assessed:
+          // distinct students with at least one evaluation report, over the
+          // students enrolled at that school.
+          completionRate: percentOf(stats.assessedStudents, stats.students),
+          // FLN collects no student satisfaction signal of any kind — there is
+          // no survey, feedback or rating collection in the schema, and the
+          // only rating that exists is a teacher's proficiency mark on a
+          // concept, which is a different measurement. Reported as null ("not
+          // tracked") rather than 0, which would read as "every child is
+          // dissatisfied" instead of "we do not know".
+          studentSatisfaction: null as number | null,
+          // Per-school evaluation pass rate: reports where the child scored at
+          // least half the questions right, over that school's reports. Same
+          // measure as interviewAnalytics.passVsFail below, scoped per school.
+          interviewSuccessRate: percentOf(stats.passed, stats.reports),
         };
       });
-      schoolRankings.sort((a, b) => b.performanceScore - a.performanceScore);
-      schoolRankings.forEach((sch, idx) => { sch.rank = idx + 1; });
 
       // Performance by state
       const performanceByState = stateDistribution.map(s => ({

@@ -1,4 +1,5 @@
 import fs from 'fs/promises';
+import { readFileSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import bcrypt from 'bcrypt';
@@ -7,6 +8,7 @@ import { CURRICULUM_MAPPING } from './config/curriculumMap';
 import type { StudentCycleLock } from './paperLock';
 import type { ScanQualityResult } from './scanQuality';
 import type { QuestionFamily } from './types/questionTemplateParams';
+import type { ErrorType } from './errorClassification';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -17,12 +19,13 @@ const DB_FILE = path.resolve(DB_DIR, 'db.json');
 // Load seed competency requirements (SRS R-7). Falls back to [] if the file
 // is missing — server still boots, but eligibility decisions will be empty
 // (cert rows never transition to 'active' until seed data is restored).
-function getSeedCompetencyRequirements(): CompetencyRequirement[] {
+export function getSeedCompetencyRequirements(): CompetencyRequirement[] {
   try {
     const seedPath = path.resolve(__dirname, 'data', 'competencyRequirements.seed.json');
-    const raw = require('fs').readFileSync(seedPath, 'utf-8');
+    const raw = readFileSync(seedPath, 'utf-8');
     return JSON.parse(raw) as CompetencyRequirement[];
-  } catch {
+  } catch (err) {
+    console.error('Failed to load seed competency requirements:', err);
     return [];
   }
 }
@@ -920,125 +923,68 @@ export interface QuestionOption {
   /** Marks a value we intend to retire but have not migrated off yet. */
   deprecated?: boolean;
 
-  metadata?: Record<string, unknown>;
+// Domain types live in dedicated modules under backend/src. db.ts retains the
+// database implementation and re-exports the domain types for backwards
+// compatibility with existing routes and services that still import them from
+// './db'.
+export * from './identity.types';
+export * from './student.types';
+export * from './curriculum.types';
+export * from './assessment.types';
+export * from './evaluation.types';
+export * from './operations.types';
 
-  createdBy: string;
-  createdAt: string;
-  updatedAt: string;
-}
+import { UserRole } from './identity.types';
+import type {
+  User,
+  School,
+  ClassGroup,
+} from './identity.types';
+import type {
+  Student,
+  TestHistoryEntry,
+} from './student.types';
+import type {
+  Question,
+  QuestionBankEntry,
+  QuestionLogic,
+  QuestionTemplate,
+  QuestionOption,
+  CurriculumLevel,
+  CandidateSkill,
+  CandidateSkillStatus,
+  CandidateSkillEvidence,
+  Skill,
+  SkillSourceType,
+  SkillValidationStatus,
+} from './curriculum.types';
+import type {
+  LevelWorksheet,
+  DiagnosticAnswerKey,
+  LevelHtmlTemplate,
+  Worksheet,
+  AnswerSubmission,
+  TeacherObservationRecord,
+  WorksheetGenerationWindow,
+  AttemptRecord,
+} from './assessment.types';
+import type { EvaluationReport } from './evaluation.types';
 
-/**
- * One teacher's rating of one student on one observable concept, for one
- * assessment cycle. Added 2026-09-19 for Balvatika's teacher-observation
- * sheet (PR #517 §4/§4b) — the counterpart to `answerSubmissions` for
- * concepts that can't be captured on a written worksheet at all (NCF-FS
- * §6.1.2(a) forbids testing at this age for some outcomes; a teacher watches
- * and records instead).
- *
- * Deliberately a separate collection from `answerSubmissions`, not a variant
- * of it: the author is the teacher, not the child; there is no scanned
- * artefact or answer key; and the rating scale is the three-level Holistic
- * Progress Card scale (PR #517 §4b), not correct/incorrect. Folding this into
- * `answerSubmissions` would force every consumer of that collection to
- * branch on "was this actually answered by a student," which is exactly the
- * kind of two-incompatible-lifecycles problem `QuestionLogic`'s own comment
- * warns against for a different pair of collections.
- *
- * One record = one (studentId, conceptId, cycle) rating. A class-grid sheet
- * and a per-child half-page sheet (PR #517 §4's two supported teacher-sheet
- * layouts) both produce the same shape of record on the backend — the
- * layout is a rendering/scanning choice, not a data-model one.
- */
-export interface TeacherObservationRecord {
-  id: string;
-  studentId: string;
-  /** The concept observed, e.g. "S3.12" (Counts in Any Order). */
-  conceptId: string;
-  teacherId: string;
-  teacherEmail: string;
-  schoolId: string;
-  classId: string;
-  cycle: string; // matches CycleName ('Baseline' | 'Mid-year' | 'End-of-year')
+import type {
+  Certification,
+  CertificationStatus,
+  CompetencyRequirement,
+  MasteryLevel,
+  Ticket,
+  LogEntry,
+  Announcement,
+  Intervention,
+  BestPractice,
+  MisconceptionCluster,
+} from './operations.types';
+import { emitKeypressEvents } from 'readline';
 
-  /**
-   * PR #517 §4/§4b's three-level scale, in both spellings used across the
-   * decision doc: the Holistic Progress Card terms, and "how much help" —
-   * same meaning, kept as one field so a UI can render either without a
-   * second lookup. Proficient = on their own; Progressive = with some help;
-   * Beginner = with a lot of help.
-   */
-  rating: 'Proficient' | 'Progressive' | 'Beginner';
 
-  /**
-   * Explicit absence-of-evidence state, distinct from `rating` entirely —
-   * PR #517 §4: "observation-only nodes show 'not yet assessed', never
-   * 'Beginner', until observation data exists." A record should not exist at
-   * all until a teacher has actually observed the child; this flag exists so
-   * a UI can distinguish "no record" (never observed) from "record exists
-   * but marked not-yet-assessed" (observed, teacher couldn't judge yet) —
-   * the two have different implications for follow-up.
-   */
-  notYetAssessed: boolean;
-
-  observedAt: string;
-  createdAt: string;
-  updatedAt: string;
-}
-
-/**
- * One row per FLN level in the canonical 93-level taxonomy.
- *
- * This collection exists to give the curriculum a single queryable home. Before
- * it, the 93 levels lived only as TypeScript in the frontend package, so every
- * backend feature that needed to reason about levels hand-authored its own copy
- * — there were six such copies at last count, in two different id spaces.
- *
- * Seeded (idempotently) by `npm run seed:levels` from
- * `frontend/src/data/skillProgressionMap.ts`. No route writes to it.
- */
-export interface CurriculumLevel {
-  /**
-   * Canonical, immutable identity. Generated once at first insert and never
-   * regenerated — student evidence points here, so renumbering would orphan it.
-   * Every other identifier on this document is an alias of this one.
-   */
-  conceptId: string;
-
-  /** L-notation, 1..93. The alias the platform standardises on. */
-  levelNumber: number;
-  /** Research S-notation, e.g. "S4.3". */
-  sCode: string;
-  /**
-   * The retired 1..59 worksheet-engine id, where one maps.
-   *
-   * Deliberately temporary: it is the bridge that lets 59-keyed content be
-   * re-keyed by lookup rather than by hand, and lets anything still speaking
-   * 59 keep working mid-migration. Null once a level has no 59-space ancestor,
-   * and the field is dropped entirely once nothing reads it.
-   */
-  legacyLevel59: number | null;
-
-  stage: string;
-  capability: string;
-  strand: string;
-
-  /** From the skill map — a level is defined by the skills it assesses. */
-  primarySkills: string[];
-  supportingSkills: string[];
-  subskills: string[];
-
-  /**
-   * Content coverage, recomputed at every seed. These are the honest answer to
-   * "how many of the 93 can we actually render today" — false is a real gap,
-   * not a defect.
-   */
-  hasStaticHtml: boolean;
-  hasBuilder: boolean;
-
-  curriculumVersion: string;
-  createdAt: string;
-  updatedAt: string;
-}
 
 interface DatabaseSchema {
   users: User[];
@@ -1068,7 +1014,11 @@ interface DatabaseSchema {
   questionOptions: QuestionOption[];
   curriculumLevels: CurriculumLevel[];
   studentCycleLocks: StudentCycleLock[];
+  generationWindows: WorksheetGenerationWindow[];
   teacherObservationRecords: TeacherObservationRecord[];
+  attemptRecords: AttemptRecord[];
+  candidateSkills: CandidateSkill[];
+  skills: Skill[];
 }
 
 const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
@@ -1081,17 +1031,17 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
   levelWorksheets: 'levelWorksheets',
   levelHtmlTemplates: 'levelHtmlTemplates',
   questionBank: 'questionBank',
-  answerSubmissions: 'answer_submissions',
-  evaluationReports: 'evaluation_reports',
+  answerSubmissions: 'answerSubmissions',
+  evaluationReports: 'evaluationReports',
   tickets: 'tickets',
   logbook: 'logbook',
   scans: 'scans',
   announcements: 'announcements',
   interventions: 'interventions',
-  bestPractices: 'best_practices',
+  bestPractices: 'bestPractices',
   diagnosticAnswerKeys: 'diagnostic_answer_keys',
   certifications: 'certifications',
-  competencyRequirements: 'competency_requirements',
+  competencyRequirements: 'competencyRequirements',
   misconceptionClusters: 'misconception_clusters',
   testHistory: 'testHistory',
   questionLogics: 'questionLogics',
@@ -1099,7 +1049,11 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
   questionOptions: 'questionOptions',
   curriculumLevels: 'curriculumLevels',
   studentCycleLocks: 'studentCycleLocks',
+  generationWindows: 'generationWindows',
   teacherObservationRecords: 'teacher_observation_records',
+  attemptRecords: 'attempt_records',
+  candidateSkills: 'candidate_skills',
+  skills: 'skills',
 };
 
 /**
@@ -1319,6 +1273,31 @@ export class DBStore {
           console.warn('Failed to ensure indexes on "evaluationReports" collection:', e.message);
         }
 
+        // #479: getAttemptRecordsForStudent is the only read today, keyed
+        // by studentId.
+        try {
+          await db.collection('attempt_records').createIndex({ studentId: 1 });
+          console.log('Successfully ensured indexes on "attempt_records" collection');
+        } catch (e: any) {
+          console.warn('Failed to ensure indexes on "attempt_records" collection:', e.message);
+        }
+
+        // Ensure indexes on D1.6 candidate_skills and skills collections (#481)
+        try {
+          const candColl = db.collection('candidate_skills');
+          await candColl.createIndex({ id: 1 }, { unique: true });
+          await candColl.createIndex({ parentSkillId: 1 });
+          await candColl.createIndex({ status: 1 });
+
+          const skillsColl = db.collection('skills');
+          await skillsColl.createIndex({ id: 1 }, { unique: true });
+          await skillsColl.createIndex({ parentSkillId: 1 });
+          await skillsColl.createIndex({ validationStatus: 1 });
+          console.log('Successfully ensured indexes on "candidate_skills" and "skills" collections');
+        } catch (e: any) {
+          console.warn('Failed to ensure indexes on "candidate_skills" and "skills" collections:', e.message);
+        }
+
         for (const [key, collName] of Object.entries(COLLECTION_NAMES)) {
           (this.data as any)[key] = [];
         }
@@ -1347,7 +1326,15 @@ export class DBStore {
       } catch (_) { }
       try {
         const content = await fs.readFile(DB_FILE, 'utf-8');
-        this.data = JSON.parse(content);
+        const parsed = JSON.parse(content);
+        // A db.json written before a collection was added to DatabaseSchema
+        // has no key for it, so the file-store branches below would throw on
+        // `this.data.<collection>.push(...)`. Default any missing collection
+        // to empty; COLLECTION_NAMES is typed to list every schema key.
+        for (const key of Object.keys(COLLECTION_NAMES) as (keyof DatabaseSchema)[]) {
+          if (!Array.isArray(parsed[key])) parsed[key] = [];
+        }
+        this.data = parsed;
       } catch (_) {
         this.data = this.getSeedData();
         await this.save();
@@ -1428,6 +1415,11 @@ export class DBStore {
   async getSchools() {
     if (this.mongoDb) return await this.mongoDb.collection<School>('schools').find({}).toArray();
     return this.data?.schools || [];
+  }
+  async getSchoolById(id: string): Promise<School | null> {
+    if (!id) return null;
+    if (this.mongoDb) return (await this.mongoDb.collection<School>('schools').findOne({ id })) as School | null;
+    return (this.data?.schools || []).find(sc => sc.id === id) ?? null;
   }
   async getClasses() {
     if (this.mongoDb) return await this.mongoDb.collection<ClassGroup>('classes').find({}).toArray();
@@ -1551,7 +1543,7 @@ export class DBStore {
     }
     return (this.data?.students || []).find(s => s.id === id) || null;
   }
-  async countStudents(opts?: { schoolId?: string; teacherId?: string; q?: string }) {
+  async countStudents(opts?: { schoolId?: string | string[]; teacherId?: string; q?: string }) {
     // Mirrors getStudents' search semantics so the route's X-Total-Count
     // header reflects the full match count, not the post-pagination
     // page count. The previous version took no `q` and the route fell
@@ -1560,7 +1552,7 @@ export class DBStore {
     const search = (opts?.q || '').trim().toLowerCase();
     if (this.mongoDb) {
       const filter: any = {};
-      if (opts?.schoolId) filter.schoolId = opts.schoolId;
+      if (opts?.schoolId) filter.schoolId = Array.isArray(opts.schoolId) ? { $in: opts.schoolId } : opts.schoolId;
       if (opts?.teacherId) filter.teacherId = opts.teacherId;
       if (search) {
         // Mirror the BSON-range + collation pattern from getStudents
@@ -1589,7 +1581,7 @@ export class DBStore {
       return await this.mongoDb.collection('students').countDocuments(filter);
     }
     let result = this.data?.students || [];
-    if (opts?.schoolId) result = result.filter(s => s.schoolId === opts.schoolId);
+    if (opts?.schoolId) { const ids = ([] as string[]).concat(opts.schoolId); result = result.filter(s => ids.includes(s.schoolId)); }
     if (opts?.teacherId) result = result.filter(s => s.teacherId === opts.teacherId);
     if (search) {
       // Same prefix-only semantics as getStudents' in-memory path.
@@ -1713,10 +1705,100 @@ export class DBStore {
     return counts;
   }
 
+  /**
+   * Per-school evaluation aggregates, for the executive school table.
+   *
+   * One pipeline over `students` (indexed on `schoolId`) that looks each
+   * child's reports up through the `evaluationReports.studentId` index, so
+   * the whole table costs a single server-side query rather than one query
+   * per school.
+   *
+   * A report counts as passed when the child got at least half the questions
+   * right. `score` is a correct-answer count on every production writer
+   * (routes/evaluation.ts, routes/students.ts, the teacher-override endpoint)
+   * measured against `totalQuestions`, so the ratio — not a raw
+   * `score >= 50` — is the comparison that holds across papers of any length.
+   * This is the same normalisation WorksheetsPanel.tsx already uses.
+   */
+  async getSchoolEvaluationStats(): Promise<Map<string, { students: number; assessedStudents: number; reports: number; passed: number }>> {
+    const empty = () => ({ students: 0, assessedStudents: 0, reports: 0, passed: 0 });
+    if (this.mongoDb) {
+      // Reads `evaluationReports` — the collection every live writer targets
+      // (addEvaluationReport, updateEvaluationReport, getEvaluationReports,
+      // and the studentId index in ensureIndexes).
+      const result = await this.mongoDb.collection('students').aggregate([
+        { $lookup: { from: 'evaluationReports', localField: 'id', foreignField: 'studentId', as: 'reports' } },
+        {
+          $project: {
+            schoolId: 1,
+            reportCount: { $size: '$reports' },
+            passedCount: {
+              $size: {
+                $filter: {
+                  input: '$reports',
+                  as: 'r',
+                  // $cond rather than $and so the divide is only evaluated when
+                  // totalQuestions is non-zero — $and does not short-circuit
+                  // and $divide by zero is an error, not a null.
+                  cond: {
+                    $cond: [
+                      { $gt: [{ $ifNull: ['$$r.totalQuestions', 0] }, 0] },
+                      { $gte: [{ $divide: ['$$r.score', '$$r.totalQuestions'] }, 0.5] },
+                      false,
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          $group: {
+            _id: '$schoolId',
+            students: { $sum: 1 },
+            assessedStudents: { $sum: { $cond: [{ $gt: ['$reportCount', 0] }, 1, 0] } },
+            reports: { $sum: '$reportCount' },
+            passed: { $sum: '$passedCount' },
+          }
+        }
+      ]).toArray();
+      const map = new Map<string, { students: number; assessedStudents: number; reports: number; passed: number }>();
+      result.forEach((r: any) => {
+        if (!r._id) return;
+        map.set(r._id, { students: r.students, assessedStudents: r.assessedStudents, reports: r.reports, passed: r.passed });
+      });
+      return map;
+    }
+    // JSON fallback store: the same four numbers, over the in-memory copy.
+    const stats = new Map<string, { students: number; assessedStudents: number; reports: number; passed: number }>();
+    const schoolByStudent = new Map<string, string>();
+    (this.data?.students || []).forEach(s => {
+      if (!s.schoolId) return;
+      schoolByStudent.set(s.id, s.schoolId);
+      const row = stats.get(s.schoolId) || empty();
+      row.students += 1;
+      stats.set(s.schoolId, row);
+    });
+    const assessed = new Set<string>();
+    (this.data?.evaluationReports || []).forEach(r => {
+      const schoolId = schoolByStudent.get(r.studentId);
+      if (!schoolId) return;
+      const row = stats.get(schoolId)!;
+      // Distinct students, so a child assessed several times still counts once.
+      if (!assessed.has(r.studentId)) {
+        assessed.add(r.studentId);
+        row.assessedStudents += 1;
+      }
+      row.reports += 1;
+      if ((r.totalQuestions || 0) > 0 && r.score / r.totalQuestions >= 0.5) row.passed += 1;
+    });
+    return stats;
+  }
+
   /** Fast aggregation: count of evaluation reports. */
   async countReports(): Promise<number> {
     if (this.mongoDb) {
-      return await this.mongoDb.collection('evaluation_reports').countDocuments({});
+      return await this.mongoDb.collection('evaluationReports').countDocuments({});
     }
     return (this.data?.evaluationReports || []).length;
   }
@@ -1724,7 +1806,7 @@ export class DBStore {
   /** Fast aggregation: count reports grouped by pass/fail (score >= 50). */
   async countReportsByOutcome(): Promise<{ pass: number; fail: number; total: number; avgScore: number }> {
     if (this.mongoDb) {
-      const result = await this.mongoDb.collection('evaluation_reports').aggregate([
+      const result = await this.mongoDb.collection('evaluationReports').aggregate([
         {
           $group: {
             _id: null,
@@ -1751,9 +1833,20 @@ export class DBStore {
     if (this.mongoDb) return await this.mongoDb.collection<Worksheet>('worksheets').find({}).toArray();
     return this.data?.worksheets || [];
   }
+  /** Worksheets with the given ids; used to resolve the questions behind a student's evaluation reports. */
+  async getWorksheetsByIds(ids: string[]): Promise<Worksheet[]> {
+    if (ids.length === 0) return [];
+    if (this.mongoDb) return await this.mongoDb.collection<Worksheet>('worksheets').find({ id: { $in: ids } }).toArray();
+    const wanted = new Set(ids);
+    return (this.data?.worksheets || []).filter(w => wanted.has(w.id));
+  }
   async getStudentCycleLocks() {
     if (this.mongoDb) return await this.mongoDb.collection<StudentCycleLock>('studentCycleLocks').find({}).toArray();
     return this.data?.studentCycleLocks || [];
+  }
+    async getGenerationWindows() {
+    if (this.mongoDb) return await this.mongoDb.collection<WorksheetGenerationWindow>('generationWindows').find({}).toArray();
+    return this.data?.generationWindows || [];
   }
   async getTestHistory(teacherId?: string) {
     if (this.mongoDb) {
@@ -1842,15 +1935,15 @@ export class DBStore {
      * Updated 2026-09-18 for PR #517 (the year-before-Class-1/"Balvatika" stage
      * finalisation against NCF-FS), which added 15 nodes and moved 4 nodes into
      * Stage 3, shifting every boundary below from L28 onward. The registry is
-     * now 108 levels, not 93.
+     * now 109 levels, not 93 (L-to-S crosswalk, PR #554).
      *
-     *   Pre-school 1:            1-7
-     *   Pre-school 2:            8-17
-     *   Year before Class 1:    18-46   (was Pre-school 3, 18-27 — see curriculumMap.ts)
-     *   Class 1:                47-59
-     *   Class 2:                60-76
-     *   Class 3:                77-90
-     *   Class 4:                91-108
+     *   Pre-school 1:            1-8
+     *   Pre-school 2:            9-18
+     *   Year before Class 1:    19-46   (Pre-school 3, the Balvatika stage — see curriculumMap.ts)
+     *   Class 1:                47-60
+     *   Class 2:                61-77
+     *   Class 3:                78-91
+     *   Class 4:                92-109
      *
      * classNumber here is documented (db.ts CertificationEligibility etc.) as 2-4
      * per SRS §3 — the classNumber<=1 branch exists but Class 1 / the year-before
@@ -1858,10 +1951,10 @@ export class DBStore {
      * + teacher-observation worksheet generation for that stage is still to be built).
      */
   static classLevelRange(classNumber: number): { min: number; max: number } {
-    if (classNumber <= 1) return { min: 47, max: 59 }; // class 1
-    if (classNumber === 2) return { min: 60, max: 76 };
-    if (classNumber === 3) return { min: 77, max: 90 };
-    return { min: 91, max: 108 }; // class 4 (and any >4 default)
+    if (classNumber <= 1) return { min: 47, max: 60 }; // class 1
+    if (classNumber === 2) return { min: 61, max: 77 };
+    if (classNumber === 3) return { min: 78, max: 91 };
+    return { min: 92, max: 109 }; // class 4 (and any >4 default)
   }
 
   /**
@@ -2087,7 +2180,12 @@ export class DBStore {
     let schoolIds: string[] | null = null;
     if (schoolFilter && Object.keys(schoolFilter).length > 0) {
       schoolIds = schools.filter(s => {
-        return Object.entries(schoolFilter).every(([k, v]) => (s as any)[k] === v);
+        return Object.entries(schoolFilter).every(([k, v]) => {
+          if (v && typeof v === 'object' && Array.isArray((v as any).$in)) {
+            return (v as any).$in.includes((s as any)[k]);
+          }
+          return (s as any)[k] === v;
+        });
       }).map(s => s.id);
     }
 
@@ -2185,12 +2283,23 @@ export class DBStore {
   // --- Write / Update Helpers ---
 
   async addUser(user: User) {
-    await this.mongoDb!.collection('users').insertOne(user);
-    if (this.data) this.data.users.push(user);
+    if (this.mongoDb) await this.mongoDb.collection('users').insertOne(user);
+    if (this.data) {
+      this.data.users.push(user);
+      if (!this.mongoDb) await this.save();
+    }
     return user;
   }
 
   async updateUserPasswordHash(userId: string, passwordHash: string) {
+    if (!this.mongoDb) {
+      const u = this.data?.users.find(x => x.id === userId);
+      if (u) {
+        u.passwordHash = passwordHash;
+        await this.save();
+      }
+      return;
+    }
     await this.mongoDb!.collection('users').updateOne({ id: userId }, { $set: { passwordHash } });
   }
 
@@ -2304,6 +2413,31 @@ export class DBStore {
     }
   }
 
+  async ensureClassesExist(schoolId: string, classNames: string[], section: string, teacherId: string) {
+    const classes: ClassGroup[] = classNames.map(className => ({
+      id: 'c_' + schoolId + '_' + className.replace(/\s+/g, '') + '_' + section,
+      schoolId,
+      className,
+      section,
+      teacherId,
+    }));
+    if (this.mongoDb && classes.length > 0) {
+      await this.mongoDb.collection<ClassGroup>('classes').bulkWrite(classes.map(cls => ({
+        updateOne: {
+          filter: { id: cls.id },
+          update: { $setOnInsert: cls },
+          upsert: true,
+        },
+      })));
+    }
+    if (this.data) {
+      for (const cls of classes) {
+        if (!this.data.classes.some(existing => existing.id === cls.id)) this.data.classes.push(cls);
+      }
+      if (!this.mongoDb && classes.length > 0) await this.save();
+    }
+  }
+
   async updateStudent(studentId: string, updates: Partial<Student>) {
     // Defense-in-depth (Phase 2 hardening): routes whitelist their fields
     // today, but this mutator accepts any Partial<Student>. Aadhaar identity
@@ -2340,6 +2474,13 @@ export class DBStore {
   }
 
   async addWorksheet(ws: Worksheet) {
+    if (!this.mongoDb) {
+      if (this.data) {
+        this.data.worksheets.push(ws);
+        await this.save();
+      }
+      return ws;
+    }
     await this.mongoDb!.collection('worksheets').insertOne(ws);
     if (this.data) this.data.worksheets.push(ws);
     return ws;
@@ -2350,7 +2491,33 @@ export class DBStore {
     if (this.data) this.data.studentCycleLocks.push(lock);
     return lock;
   }
+  async addGenerationWindow(window: WorksheetGenerationWindow) {
+    if (this.mongoDb) await this.mongoDb.collection('generationWindows').insertOne(window);
+    if (this.data) this.data.generationWindows.push(window);
+    return window;
+  }
+  async updateGenerationWindow(
+    id: string,
+    updates: Partial<WorksheetGenerationWindow>
+  ) {
+    if (this.mongoDb) {
+      await this.mongoDb.collection<WorksheetGenerationWindow>('generationWindows').updateOne(
+        { id },
+        { $set: updates }
+      );
+    }
 
+    if (this.data) {
+      const index = this.data.generationWindows.findIndex(window => window.id === id);
+
+      if (index !== -1) {
+        this.data.generationWindows[index] = {
+          ...this.data.generationWindows[index],
+          ...updates
+        };
+      }
+    }
+  }
   async addTestHistoryEntry(entry: TestHistoryEntry) {
     if (this.mongoDb) {
       await this.mongoDb.collection('testHistory').insertOne(entry);
@@ -2360,6 +2527,15 @@ export class DBStore {
   }
 
   async updateWorksheet(worksheetId: string, updates: Partial<Worksheet>) {
+    if (!this.mongoDb) {
+      const list = this.data?.worksheets;
+      if (!list) return undefined;
+      const idx = list.findIndex(x => x.id === worksheetId);
+      if (idx === -1) return undefined;
+      list[idx] = { ...list[idx], ...updates };
+      await this.save();
+      return list[idx];
+    }
     await this.mongoDb!.collection('worksheets').updateOne({ id: worksheetId }, { $set: updates });
     const ws = await this.mongoDb!.collection<Worksheet>('worksheets').findOne({ id: worksheetId });
     if (ws && this.data) {
@@ -2370,18 +2546,39 @@ export class DBStore {
   }
 
   async addLevelWorksheet(ws: LevelWorksheet) {
+    if (!this.mongoDb) {
+      if (this.data) {
+        this.data.levelWorksheets.push(ws);
+        await this.save();
+      }
+      return ws;
+    }
     await this.mongoDb!.collection('levelWorksheets').insertOne(ws);
     if (this.data) this.data.levelWorksheets.push(ws);
     return ws;
   }
 
   async addAnswerSubmission(sub: AnswerSubmission) {
+    if (!this.mongoDb) {
+      if (this.data) {
+        this.data.answerSubmissions.push(sub);
+        await this.save();
+      }
+      return sub;
+    }
     await this.mongoDb!.collection('answerSubmissions').insertOne(sub);
     if (this.data) this.data.answerSubmissions.push(sub);
     return sub;
   }
 
   async addEvaluationReport(rep: EvaluationReport) {
+    if (!this.mongoDb) {
+      if (this.data) {
+        this.data.evaluationReports.push(rep);
+        await this.save();
+      }
+      return rep;
+    }
     await this.mongoDb!.collection('evaluationReports').insertOne(rep);
     if (this.data) this.data.evaluationReports.push(rep);
     return rep;
@@ -2409,22 +2606,32 @@ export class DBStore {
   }
 
   async addCertification(cert: Certification) {
+    if (!this.mongoDb) {
+      if (this.data) {
+        this.data.certifications.push(cert);
+        await this.save();
+      }
+      return cert;
+    }
     await this.mongoDb!.collection('certifications').insertOne(cert);
     if (this.data) this.data.certifications.push(cert);
     return cert;
   }
 
   async updateCertification(certId: string, updates: Partial<Certification>) {
+    if (!this.mongoDb) {
+      const list = this.data?.certifications;
+      if (!list) return undefined;
+      const idx = list.findIndex(x => x.id === certId);
+      if (idx === -1) return undefined;
+      list[idx] = { ...list[idx], ...updates };
+      await this.save();
+      return list[idx];
+    }
     await this.mongoDb!.collection('certifications').updateOne({ id: certId }, { $set: updates });
     if (this.mongoDb) {
       return await this.mongoDb.collection<Certification>('certifications').findOne({ id: certId });
     }
-    const idx = this.data?.certifications.findIndex(c => c.id === certId);
-    if (idx !== undefined && idx !== -1 && this.data) {
-      this.data.certifications[idx] = { ...this.data.certifications[idx], ...updates };
-      return this.data.certifications[idx];
-    }
-    return null;
   }
 
   /** Optimistic concurrency: only update if version still matches. Returns null if no match. */
@@ -2432,7 +2639,7 @@ export class DBStore {
     if (this.mongoDb) {
       const result = await this.mongoDb.collection<Certification>('certifications').findOneAndUpdate(
         { id: certId, version: expectedVersion },
-        { $set: updates },
+        { $set: updates, $inc: { version: 1 } },
         { returnDocument: 'after' }
       );
       return result || null;
@@ -2440,7 +2647,7 @@ export class DBStore {
     if (this.data) {
       const idx = this.data.certifications.findIndex(c => c.id === certId && c.version === expectedVersion);
       if (idx === -1) return null;
-      this.data.certifications[idx] = { ...this.data.certifications[idx], ...updates };
+      this.data.certifications[idx] = { ...this.data.certifications[idx], ...updates, version: this.data.certifications[idx].version + 1 };
       await this.save();
       return this.data.certifications[idx];
     }
@@ -2482,12 +2689,28 @@ export class DBStore {
   }
 
   async addTicket(t: Ticket) {
+    if (!this.mongoDb) {
+      if (this.data) {
+        this.data.tickets.push(t);
+        await this.save();
+      }
+      return t;
+    }
     await this.mongoDb!.collection('tickets').insertOne(t);
     if (this.data) this.data.tickets.push(t);
     return t;
   }
 
   async updateTicket(id: string, updates: Partial<Ticket>) {
+    if (!this.mongoDb) {
+      const list = this.data?.tickets;
+      if (!list) return undefined;
+      const idx = list.findIndex(x => x.id === id);
+      if (idx === -1) return undefined;
+      list[idx] = { ...list[idx], ...updates };
+      await this.save();
+      return list[idx];
+    }
     await this.mongoDb!.collection('tickets').updateOne({ id }, { $set: updates });
     const t = await this.mongoDb!.collection<Ticket>('tickets').findOne({ id });
     if (t && this.data) {
@@ -2498,6 +2721,15 @@ export class DBStore {
   }
 
   async updateUser(userId: string, updates: Partial<User>) {
+    if (!this.mongoDb) {
+      const list = this.data?.users;
+      if (!list) return undefined;
+      const idx = list.findIndex(x => x.id === userId);
+      if (idx === -1) return undefined;
+      list[idx] = { ...list[idx], ...updates };
+      await this.save();
+      return list[idx];
+    }
     await this.mongoDb!.collection('users').updateOne({ id: userId }, { $set: updates });
     const u = await this.mongoDb!.collection<User>('users').findOne({ id: userId });
     if (u && this.data) {
@@ -2508,6 +2740,15 @@ export class DBStore {
   }
 
   async updateSchool(schoolId: string, updates: Partial<School>) {
+    if (!this.mongoDb) {
+      const list = this.data?.schools;
+      if (!list) return undefined;
+      const idx = list.findIndex(x => x.id === schoolId);
+      if (idx === -1) return undefined;
+      list[idx] = { ...list[idx], ...updates };
+      await this.save();
+      return list[idx];
+    }
     await this.mongoDb!.collection('schools').updateOne({ id: schoolId }, { $set: updates });
     const s = await this.mongoDb!.collection<School>('schools').findOne({ id: schoolId });
     if (s && this.data) {
@@ -2518,9 +2759,52 @@ export class DBStore {
   }
 
   async addSchool(school: School) {
-    await this.mongoDb!.collection('schools').insertOne(school);
-    if (this.data) this.data.schools.push(school);
+    if (this.mongoDb) await this.mongoDb.collection('schools').insertOne(school);
+    if (this.data) {
+      this.data.schools.push(school);
+      if (!this.mongoDb) await this.save();
+    }
     return school;
+  }
+
+  async deleteSchool(id: string): Promise<boolean> {
+    if (this.mongoDb) {
+      await this.mongoDb.collection('schools').deleteOne({ id });
+    }
+    if (this.data) {
+      const idx = this.data.schools.findIndex(s => s.id === id);
+      if (idx !== -1) {
+        this.data.schools.splice(idx, 1);
+        if (!this.mongoDb) await this.save();
+      }
+    }
+    return true;
+  }
+
+  async deleteUser(id: string): Promise<boolean> {
+    if (this.mongoDb) {
+      await this.mongoDb.collection('users').deleteOne({ id });
+    }
+    if (this.data) {
+      const idx = this.data.users.findIndex(u => u.id === id);
+      if (idx !== -1) {
+        this.data.users.splice(idx, 1);
+        if (!this.mongoDb) await this.save();
+      }
+    }
+    return true;
+  }
+
+  async deleteClassesForSchool(schoolId: string): Promise<number> {
+    if (this.mongoDb) {
+      await this.mongoDb.collection('classes').deleteMany({ schoolId });
+    }
+    if (this.data) {
+      const initialLen = this.data.classes.length;
+      this.data.classes = this.data.classes.filter(c => c.schoolId !== schoolId);
+      if (!this.mongoDb && this.data.classes.length !== initialLen) await this.save();
+    }
+    return 0;
   }
 
   async addLog(log: LogEntry) {
@@ -2658,6 +2942,13 @@ export class DBStore {
   }
 
   async addAnnouncement(ann: Announcement) {
+    if (!this.mongoDb) {
+      if (this.data) {
+        this.data.announcements.unshift(ann);
+        await this.save();
+      }
+      return ann;
+    }
     await this.mongoDb!.collection('announcements').insertOne(ann);
     if (this.data) this.data.announcements.unshift(ann);
     return ann;
@@ -2666,16 +2957,33 @@ export class DBStore {
   // --- Intervention & Best Practice Methods ---
 
   async getInterventions() {
+    if (!this.mongoDb) return this.data?.interventions || [];
     return await this.mongoDb!.collection<Intervention>('interventions').find({}).toArray();
   }
 
   async addIntervention(intervention: Intervention) {
+    if (!this.mongoDb) {
+      if (this.data) {
+        this.data.interventions.push(intervention);
+        await this.save();
+      }
+      return intervention;
+    }
     await this.mongoDb!.collection('interventions').insertOne(intervention);
     if (this.data) this.data.interventions.push(intervention);
     return intervention;
   }
 
   async updateIntervention(id: string, updates: Partial<Intervention>) {
+    if (!this.mongoDb) {
+      const list = this.data?.interventions;
+      if (!list) return undefined;
+      const idx = list.findIndex(x => x.id === id);
+      if (idx === -1) return undefined;
+      list[idx] = { ...list[idx], ...updates };
+      await this.save();
+      return list[idx];
+    }
     await this.mongoDb!.collection('interventions').updateOne({ id }, { $set: updates });
     const i = await this.mongoDb!.collection<Intervention>('interventions').findOne({ id });
     if (i && this.data) {
@@ -2686,16 +2994,33 @@ export class DBStore {
   }
 
   async getBestPractices() {
+    if (!this.mongoDb) return this.data?.bestPractices || [];
     return await this.mongoDb!.collection<BestPractice>('bestPractices').find({}).toArray();
   }
 
   async addBestPractice(bp: BestPractice) {
+    if (!this.mongoDb) {
+      if (this.data) {
+        this.data.bestPractices.push(bp);
+        await this.save();
+      }
+      return bp;
+    }
     await this.mongoDb!.collection('bestPractices').insertOne(bp);
     if (this.data) this.data.bestPractices.push(bp);
     return bp;
   }
 
   async updateBestPractice(id: string, updates: Partial<BestPractice>) {
+    if (!this.mongoDb) {
+      const list = this.data?.bestPractices;
+      if (!list) return undefined;
+      const idx = list.findIndex(x => x.id === id);
+      if (idx === -1) return undefined;
+      list[idx] = { ...list[idx], ...updates };
+      await this.save();
+      return list[idx];
+    }
     await this.mongoDb!.collection('bestPractices').updateOne({ id }, { $set: updates });
     const bp = await this.mongoDb!.collection<BestPractice>('bestPractices').findOne({ id });
     if (bp && this.data) {
@@ -2709,22 +3034,46 @@ export class DBStore {
 
   /** Live logics only unless `includeDeleted`, since soft-deleted rows exist purely for audit. */
   async getQuestionLogics(includeDeleted = false) {
+    if (!this.mongoDb) {
+      // Mirrors the Mongo query below: `{ deletedAt: null }` matches a null
+      // OR missing field (hence `==`), sorted by createdAt descending.
+      return (this.data?.questionLogics || [])
+        .filter(l => includeDeleted || l.deletedAt == null)
+        .sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0));
+    }
     const filter = includeDeleted ? {} : { deletedAt: null };
     return await this.mongoDb!.collection<QuestionLogic>('questionLogics')
       .find(filter).sort({ createdAt: -1 }).toArray();
   }
 
   async getQuestionLogicById(id: string) {
+    if (!this.mongoDb) return this.data?.questionLogics.find(x => x.id === id) || undefined;
     return (await this.mongoDb!.collection<QuestionLogic>('questionLogics').findOne({ id })) || undefined;
   }
 
   async addQuestionLogic(logic: QuestionLogic) {
+    if (!this.mongoDb) {
+      if (this.data) {
+        this.data.questionLogics.push(logic);
+        await this.save();
+      }
+      return logic;
+    }
     await this.mongoDb!.collection('questionLogics').insertOne(logic);
     if (this.data) this.data.questionLogics.push(logic);
     return logic;
   }
 
   async updateQuestionLogic(id: string, updates: Partial<QuestionLogic>) {
+    if (!this.mongoDb) {
+      const list = this.data?.questionLogics;
+      if (!list) return undefined;
+      const idx = list.findIndex(x => x.id === id);
+      if (idx === -1) return undefined;
+      list[idx] = { ...list[idx], ...updates };
+      await this.save();
+      return list[idx];
+    }
     await this.mongoDb!.collection('questionLogics').updateOne({ id }, { $set: updates });
     const l = await this.mongoDb!.collection<QuestionLogic>('questionLogics').findOne({ id });
     if (l && this.data) {
@@ -2739,6 +3088,14 @@ export class DBStore {
    * rows — authoring five logics for one level still covers exactly one level.
    */
   async getQuestionLogicStats(totalLevels: number) {
+    if (!this.mongoDb) {
+      const live = (this.data?.questionLogics || []).filter(l => l.deletedAt == null);
+      return {
+        totalLogics: live.length,
+        totalLevels,
+        levelsWithLogic: new Set(live.map(l => l.level)).size,
+      };
+    }
     const live = await this.mongoDb!.collection<QuestionLogic>('questionLogics')
       .find({ deletedAt: null }).toArray();
     return {
@@ -2755,17 +3112,24 @@ export class DBStore {
   // a reference that quietly stops meaning what it meant when it was written.
 
   async getQuestionTemplates(includeDeleted = false) {
+    if (!this.mongoDb) {
+      return (this.data?.questionTemplates || [])
+        .filter(t => includeDeleted || t.deletedAt == null)
+        .sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0));
+    }
     const filter = includeDeleted ? {} : { deletedAt: null };
     return await this.mongoDb!.collection<QuestionTemplate>('questionTemplates')
       .find(filter).sort({ createdAt: -1 }).toArray();
   }
 
   async getQuestionTemplateById(id: string) {
+    if (!this.mongoDb) return this.data?.questionTemplates.find(x => x.id === id) || undefined;
     return (await this.mongoDb!.collection<QuestionTemplate>('questionTemplates').findOne({ id })) || undefined;
   }
 
   /** Every live question assessing a given concept — the direct "what tests S3.4" lookup, index-backed. */
   async getQuestionTemplatesByConcept(conceptId: string) {
+    if (!this.mongoDb) return (this.data?.questionTemplates || []).filter(t => t.conceptId === conceptId && t.deletedAt == null);
     return await this.mongoDb!.collection<QuestionTemplate>('questionTemplates')
       .find({ conceptId, deletedAt: null }).toArray();
   }
@@ -2778,23 +3142,33 @@ export class DBStore {
    * question x skill combination.
    */
   async getQuestionTemplatesBySkill(skillId: string) {
+    if (!this.mongoDb) return (this.data?.questionTemplates || []).filter(t => (t.skills || []).includes(skillId) && t.deletedAt == null);
     return await this.mongoDb!.collection<QuestionTemplate>('questionTemplates')
       .find({ skills: skillId, deletedAt: null }).toArray();
   }
 
   /** Same lookup at subskill granularity, e.g. "SK18.08" (Identify pattern rule). */
   async getQuestionTemplatesBySubskill(subskillId: string) {
+    if (!this.mongoDb) return (this.data?.questionTemplates || []).filter(t => (t.subskills || []).includes(subskillId) && t.deletedAt == null);
     return await this.mongoDb!.collection<QuestionTemplate>('questionTemplates')
       .find({ subskills: subskillId, deletedAt: null }).toArray();
   }
 
   /** Live templates sharing a variant fingerprint. Drives the duplicate warning. */
   async getQuestionTemplatesByVariantKey(variantKey: string) {
+    if (!this.mongoDb) return (this.data?.questionTemplates || []).filter(t => t.variantKey === variantKey && t.deletedAt == null);
     return await this.mongoDb!.collection<QuestionTemplate>('questionTemplates')
       .find({ variantKey, deletedAt: null }).toArray();
   }
 
   async addQuestionTemplate(template: QuestionTemplate) {
+    if (!this.mongoDb) {
+      if (this.data) {
+        this.data.questionTemplates.push(template);
+        await this.save();
+      }
+      return template;
+    }
     await this.mongoDb!.collection('questionTemplates').insertOne(template);
     if (this.data) this.data.questionTemplates.push(template);
     return template;
@@ -2809,12 +3183,14 @@ export class DBStore {
 
   /** One student's ratings across every observed concept, for one cycle. */
   async getObservationRecordsForStudent(studentId: string, cycle: string) {
+    if (!this.mongoDb) return (this.data?.teacherObservationRecords || []).filter(r => r.studentId === studentId && r.cycle === cycle);
     return await this.mongoDb!.collection<TeacherObservationRecord>('teacher_observation_records')
       .find({ studentId, cycle }).toArray();
   }
 
   /** A whole class's ratings on one concept, for one cycle -- the class-grid sheet's read path. */
   async getObservationRecordsForClass(classId: string, cycle: string) {
+    if (!this.mongoDb) return (this.data?.teacherObservationRecords || []).filter(r => r.classId === classId && r.cycle === cycle);
     return await this.mongoDb!.collection<TeacherObservationRecord>('teacher_observation_records')
       .find({ classId, cycle }).toArray();
   }
@@ -2825,11 +3201,45 @@ export class DBStore {
    * rather than duplicating it.
    */
   async upsertObservationRecord(record: TeacherObservationRecord) {
+    if (!this.mongoDb) {
+      if (this.data) {
+        const list = this.data.teacherObservationRecords;
+        const idx = list.findIndex(x => x.studentId === record.studentId && x.conceptId === record.conceptId && x.cycle === record.cycle);
+        if (idx === -1) list.push(record);
+        else list[idx] = { ...list[idx], ...record };
+        await this.save();
+      }
+      return record;
+    }
     await this.mongoDb!.collection<TeacherObservationRecord>('teacher_observation_records').updateOne(
       { studentId: record.studentId, conceptId: record.conceptId, cycle: record.cycle },
       { $set: record },
       { upsert: true }
     );
+    return record;
+  }
+
+  // --- Attempt Record Methods (Evidence Model, #479) ----------------------
+  // See AttemptRecord's own comment for what this captures and why it's a
+  // separate collection from answerSubmissions.
+
+  /** Every attempt one student has made; richest-evidence-first filtering/sorting is left to callers. */
+  async getAttemptRecordsForStudent(studentId: string): Promise<AttemptRecord[]> {
+    if (!this.mongoDb) return (this.data?.attemptRecords || []).filter(a => a.studentId === studentId);
+    return await this.mongoDb!.collection<AttemptRecord>('attempt_records').find({ studentId }).toArray();
+  }
+
+  /** Append-only -- an attempt is a historical fact, not something a later attempt should overwrite. */
+  async addAttemptRecord(record: AttemptRecord): Promise<AttemptRecord> {
+    if (!this.mongoDb) {
+      if (this.data) {
+        if (!this.data.attemptRecords) this.data.attemptRecords = [];
+        this.data.attemptRecords.push(record);
+        await this.save();
+      }
+      return record;
+    }
+    await this.mongoDb!.collection('attempt_records').insertOne(record);
     return record;
   }
 
@@ -2842,12 +3252,28 @@ export class DBStore {
    */
   async addQuestionTemplates(templates: QuestionTemplate[]) {
     if (templates.length === 0) return [];
+    if (!this.mongoDb) {
+      if (this.data) {
+        this.data.questionTemplates.push(...templates);
+        await this.save();
+      }
+      return templates;
+    }
     await this.mongoDb!.collection('questionTemplates').insertMany(templates as any[]);
     if (this.data) this.data.questionTemplates.push(...templates);
     return templates;
   }
 
   async updateQuestionTemplate(id: string, updates: Partial<QuestionTemplate>) {
+    if (!this.mongoDb) {
+      const list = this.data?.questionTemplates;
+      if (!list) return undefined;
+      const idx = list.findIndex(x => x.id === id);
+      if (idx === -1) return undefined;
+      list[idx] = { ...list[idx], ...updates };
+      await this.save();
+      return list[idx];
+    }
     await this.mongoDb!.collection('questionTemplates').updateOne({ id }, { $set: updates });
     const t = await this.mongoDb!.collection<QuestionTemplate>('questionTemplates').findOne({ id });
     if (t && this.data) {
@@ -2864,28 +3290,52 @@ export class DBStore {
   // Superadmin adds a value matters more than saving a small query.
 
   async getQuestionOptions(includeInactive = false) {
+    if (!this.mongoDb) {
+      // Mirrors `.find(filter).sort({ type: 1, key: 1 })` below.
+      return (this.data?.questionOptions || [])
+        .filter(o => includeInactive || o.active === true)
+        .sort((a, b) => (a.type !== b.type ? (a.type < b.type ? -1 : 1) : a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+    }
     const filter = includeInactive ? {} : { active: true };
     return await this.mongoDb!.collection<QuestionOption>('questionOptions')
       .find(filter).sort({ type: 1, key: 1 }).toArray();
   }
 
   async getQuestionOptionById(id: string) {
+    if (!this.mongoDb) return this.data?.questionOptions.find(x => x.id === id) || undefined;
     return (await this.mongoDb!.collection<QuestionOption>('questionOptions').findOne({ id })) || undefined;
   }
 
   /** Active row with this (type, key), if any. Used to reject duplicate keys. */
   async getQuestionOptionByKey(type: QuestionOption['type'], key: string) {
+    if (!this.mongoDb) return this.data?.questionOptions.find(o => o.type === type && o.key === key && o.active === true) || undefined;
     return (await this.mongoDb!.collection<QuestionOption>('questionOptions')
       .findOne({ type, key, active: true })) || undefined;
   }
 
   async addQuestionOption(option: QuestionOption) {
+    if (!this.mongoDb) {
+      if (this.data) {
+        this.data.questionOptions.push(option);
+        await this.save();
+      }
+      return option;
+    }
     await this.mongoDb!.collection('questionOptions').insertOne(option);
     if (this.data) this.data.questionOptions.push(option);
     return option;
   }
 
   async updateQuestionOption(id: string, updates: Partial<QuestionOption>) {
+    if (!this.mongoDb) {
+      const list = this.data?.questionOptions;
+      if (!list) return undefined;
+      const idx = list.findIndex(x => x.id === id);
+      if (idx === -1) return undefined;
+      list[idx] = { ...list[idx], ...updates };
+      await this.save();
+      return list[idx];
+    }
     await this.mongoDb!.collection('questionOptions').updateOne({ id }, { $set: updates });
     const o = await this.mongoDb!.collection<QuestionOption>('questionOptions').findOne({ id });
     if (o && this.data) {
@@ -2896,6 +3346,15 @@ export class DBStore {
   }
 
   async getQuestionTemplateStats(totalLevels: number) {
+    if (!this.mongoDb) {
+      const live = (this.data?.questionTemplates || []).filter(t => t.deletedAt == null);
+      return {
+        totalTemplates: live.length,
+        totalLevels,
+        levelsWithTemplate: new Set(live.map(t => t.conceptId)).size,
+        distinctVariants: new Set(live.map(t => t.variantKey)).size,
+      };
+    }
     const live = await this.mongoDb!.collection<QuestionTemplate>('questionTemplates')
       .find({ deletedAt: null }).toArray();
     return {
@@ -2928,6 +3387,22 @@ export class DBStore {
     limit?: number;
     skip?: number;
   } = {}) {
+    if (!this.mongoDb) {
+      let items = (this.data?.questionBank || []).slice();
+      if (opts.level !== undefined) items = items.filter(e => e.level === opts.level);
+      if (opts.sectionType) items = items.filter(e => e.sectionType === opts.sectionType);
+      if (opts.status) items = items.filter(e => e.reviewStatus === opts.status);
+      if (opts.mappedLevel !== undefined) items = items.filter(e => e.mappedLevel === opts.mappedLevel);
+      const total = items.length;
+      items.sort((a, b) => {
+        if (a.level !== b.level) return a.level - b.level;
+        if (a.section !== b.section) return (a.section < b.section ? -1 : 1);
+        return a.questionNumber - b.questionNumber;
+      });
+      const skip = opts.skip || 0;
+      const limit = opts.limit || 50;
+      return { items: items.slice(skip, skip + limit), total };
+    }
     const filter: any = {};
     if (opts.level !== undefined) filter.level = opts.level;
     if (opts.sectionType) filter.sectionType = opts.sectionType;
@@ -2943,6 +3418,9 @@ export class DBStore {
   }
 
   async getQuestionBankEntry(questionId: string) {
+    if (!this.mongoDb) {
+      return (this.data?.questionBank || []).find(e => e.questionId === questionId);
+    }
     return (await this.mongoDb!.collection<QuestionBankEntry>('questionBank')
       .findOne({ questionId })) || undefined;
   }
@@ -2955,6 +3433,14 @@ export class DBStore {
     reviewedBy: string;
     reviewNote?: string;
   }) {
+    if (!this.mongoDb) {
+      const entry = (this.data?.questionBank || []).find(e => e.questionId === questionId);
+      if (entry) {
+        Object.assign(entry, patch, { reviewedAt: new Date().toISOString() });
+        await this.save();
+      }
+      return entry;
+    }
     const coll = this.mongoDb!.collection<QuestionBankEntry>('questionBank');
     await coll.updateOne({ questionId }, {
       $set: { ...patch, reviewedAt: new Date().toISOString() } as any,
@@ -2969,6 +3455,22 @@ export class DBStore {
     reviewStatus: 'untagged' | 'mapped' | 'retired';
     reviewedBy: string;
   }) {
+    if (!this.mongoDb) {
+      const list = (this.data?.questionBank || []).filter(e => {
+        if (e.level !== filter.level) return false;
+        if (filter.section && e.section !== filter.section) return false;
+        if (filter.sectionType && e.sectionType !== filter.sectionType) return false;
+        return true;
+      });
+      const now = new Date().toISOString();
+      for (const entry of list) {
+        Object.assign(entry, patch, { reviewedAt: now });
+      }
+      if (list.length > 0) {
+        await this.save();
+      }
+      return { matched: list.length, modified: list.length };
+    }
     const q: any = { level: filter.level };
     if (filter.section) q.section = filter.section;
     if (filter.sectionType) q.sectionType = filter.sectionType;
@@ -2986,6 +3488,39 @@ export class DBStore {
    * mapped level-to-level instead.
    */
   async getQuestionBankProgress() {
+    if (!this.mongoDb) {
+      const list = this.data?.questionBank || [];
+      const total = list.length;
+      const mapped = list.filter(e => e.reviewStatus === 'mapped').length;
+      const retired = list.filter(e => e.reviewStatus === 'retired').length;
+      const untagged = list.filter(e => e.reviewStatus === 'untagged').length;
+      const levels = Array.from(new Set(list.map(e => e.level))).sort((a, b) => a - b);
+      const targetLevelsCovered = Array.from(new Set(
+        list
+          .filter(e => e.reviewStatus === 'mapped' && typeof e.mappedLevel === 'number')
+          .map(e => e.mappedLevel as number)
+      )).sort((a, b) => a - b);
+      const byLevelMap = new Map<number, { total: number; mapped: number; retired: number }>();
+      for (const e of list) {
+        let stat = byLevelMap.get(e.level);
+        if (!stat) {
+          stat = { total: 0, mapped: 0, retired: 0 };
+          byLevelMap.set(e.level, stat);
+        }
+        stat.total++;
+        if (e.reviewStatus === 'mapped') stat.mapped++;
+        if (e.reviewStatus === 'retired') stat.retired++;
+      }
+      const byLevel = Array.from(byLevelMap.entries())
+        .sort((a, b) => a[0] - b[0])
+        .map(([level, stats]) => ({ level, ...stats }));
+      return {
+        total, mapped, retired, untagged,
+        legacyLevelsInBank: levels,
+        targetLevelsCovered,
+        byLevel,
+      };
+    }
     const coll = this.mongoDb!.collection<QuestionBankEntry>('questionBank');
     const [total, mapped, retired, untagged, levels, targets] = await Promise.all([
       coll.countDocuments({}),
@@ -3013,17 +3548,26 @@ export class DBStore {
   }
 
   async getCurriculumLevels() {
+    if (!this.mongoDb) {
+      return [...(this.data?.curriculumLevels || [])].sort((a, b) => a.levelNumber - b.levelNumber);
+    }
     return await this.mongoDb!.collection<CurriculumLevel>('curriculumLevels')
       .find({}).sort({ levelNumber: 1 }).toArray();
   }
 
   async getCurriculumLevel(levelNumber: number) {
+    if (!this.mongoDb) {
+      return (this.data?.curriculumLevels || []).find(l => l.levelNumber === levelNumber);
+    }
     return (await this.mongoDb!.collection<CurriculumLevel>('curriculumLevels')
       .findOne({ levelNumber })) || undefined;
   }
 
   /** Look a level up by its permanent identity rather than by its position. */
   async getCurriculumLevelByConceptId(conceptId: string) {
+    if (!this.mongoDb) {
+      return (this.data?.curriculumLevels || []).find(l => l.conceptId === conceptId);
+    }
     return (await this.mongoDb!.collection<CurriculumLevel>('curriculumLevels')
       .findOne({ conceptId })) || undefined;
   }
@@ -3036,6 +3580,9 @@ export class DBStore {
    * the last such call site is gone, this method and `legacyLevel59` go with it.
    */
   async getCurriculumLevelByLegacy59(legacyLevel59: number) {
+    if (!this.mongoDb) {
+      return (this.data?.curriculumLevels || []).find(l => l.legacyLevel59 === legacyLevel59);
+    }
     return (await this.mongoDb!.collection<CurriculumLevel>('curriculumLevels')
       .findOne({ legacyLevel59 })) || undefined;
   }
@@ -3048,6 +3595,23 @@ export class DBStore {
    * landed.
    */
   async setCurriculumLegacyMapping(levelNumber: number | null, legacyLevel59: number) {
+    if (!this.mongoDb) {
+      const list = this.data?.curriculumLevels || [];
+      for (const l of list) {
+        if (l.legacyLevel59 === legacyLevel59) {
+          l.legacyLevel59 = null;
+        }
+      }
+      if (levelNumber !== null) {
+        const target = list.find(l => l.levelNumber === levelNumber);
+        if (target) {
+          target.legacyLevel59 = legacyLevel59;
+          target.updatedAt = new Date().toISOString();
+        }
+      }
+      await this.save();
+      return;
+    }
     const coll = this.mongoDb!.collection<CurriculumLevel>('curriculumLevels');
     // Only one 93-space level may claim a given legacy id.
     await coll.updateMany({ legacyLevel59 }, { $set: { legacyLevel59: null } });
@@ -3068,6 +3632,88 @@ export class DBStore {
       withAnyContent: levels.filter(l => l.hasStaticHtml || l.hasBuilder).length,
       mappedFromLegacy59: levels.filter(l => l.legacyLevel59 !== null).length,
     };
+  }
+
+  // --- D1.6 Skill Evolution: Candidate Skills & Skills Methods (#481) ---
+
+  async addCandidateSkill(candidate: CandidateSkill): Promise<CandidateSkill> {
+    if (this.mongoDb) {
+      await this.mongoDb.collection<CandidateSkill>('candidate_skills').insertOne(candidate);
+    }
+    if (this.data) {
+      if (!this.data.candidateSkills) this.data.candidateSkills = [];
+      this.data.candidateSkills.push(candidate);
+      if (!this.mongoDb) await this.save();
+    }
+    return candidate;
+  }
+
+  async getCandidateSkills(filter?: { status?: CandidateSkillStatus; parentSkillId?: string }): Promise<CandidateSkill[]> {
+    if (this.mongoDb) {
+      const q: any = {};
+      if (filter?.status) q.status = filter.status;
+      if (filter?.parentSkillId) q.parentSkillId = filter.parentSkillId;
+      return await this.mongoDb.collection<CandidateSkill>('candidate_skills').find(q).sort({ createdAt: -1 }).toArray();
+    }
+    let list = this.data?.candidateSkills || [];
+    if (filter?.status) list = list.filter(c => c.status === filter.status);
+    if (filter?.parentSkillId) list = list.filter(c => c.parentSkillId === filter.parentSkillId);
+    return list;
+  }
+
+  async getCandidateSkillById(id: string): Promise<CandidateSkill | undefined> {
+    if (this.mongoDb) {
+      return (await this.mongoDb.collection<CandidateSkill>('candidate_skills').findOne({ id })) || undefined;
+    }
+    return (this.data?.candidateSkills || []).find(c => c.id === id);
+  }
+
+  async updateCandidateSkill(id: string, updates: Partial<CandidateSkill>): Promise<CandidateSkill | undefined> {
+    const updatedAt = new Date().toISOString();
+    const finalUpdates = { ...updates, updatedAt };
+    if (this.mongoDb) {
+      await this.mongoDb.collection<CandidateSkill>('candidate_skills').updateOne({ id }, { $set: finalUpdates });
+      return (await this.mongoDb.collection<CandidateSkill>('candidate_skills').findOne({ id })) || undefined;
+    }
+    const idx = (this.data?.candidateSkills || []).findIndex(c => c.id === id);
+    if (idx !== -1 && this.data) {
+      this.data.candidateSkills[idx] = { ...this.data.candidateSkills[idx], ...finalUpdates };
+      if (!this.mongoDb) await this.save();
+      return this.data.candidateSkills[idx];
+    }
+    return undefined;
+  }
+
+  async addSkill(skill: Skill): Promise<Skill> {
+    if (this.mongoDb) {
+      await this.mongoDb.collection<Skill>('skills').insertOne(skill);
+    }
+    if (this.data) {
+      if (!this.data.skills) this.data.skills = [];
+      this.data.skills.push(skill);
+      if (!this.mongoDb) await this.save();
+    }
+    return skill;
+  }
+
+  async getSkills(filter?: { parentSkillId?: string; validationStatus?: SkillValidationStatus }): Promise<Skill[]> {
+    if (this.mongoDb) {
+      const q: any = {};
+      if (filter?.parentSkillId) q.parentSkillId = filter.parentSkillId;
+      if (filter?.validationStatus) q.validationStatus = filter.validationStatus;
+      return await this.mongoDb.collection<Skill>('skills').find(q).sort({ id: 1 }).toArray();
+    }
+    let list = this.data?.skills || [];
+    if (filter?.parentSkillId) list = list.filter(s => s.parentSkillId === filter.parentSkillId);
+    if (filter?.validationStatus) list = list.filter(s => s.validationStatus === filter.validationStatus);
+    return list;
+  }
+
+  async getSkillById(id: string): Promise<Skill | undefined> {
+    if (this.mongoDb) {
+      return (await this.mongoDb.collection<Skill>('skills').findOne({ id })) || undefined;
+    }
+    return (this.data?.skills || []).find(s => s.id === id);
   }
 
   // --- Diagnostic Answer Key Methods ---
@@ -4996,15 +5642,23 @@ export class DBStore {
       // intent in front of the question-generation pipeline.
       questionLogics: [],
       questionTemplates: [],
-      questionOptions: [],
+            questionOptions: [],
       // Populated by `npm run seed:levels`, not by the demo seed — the
       // curriculum is real data with one source, not fixture content.
       curriculumLevels: [],
       studentCycleLocks: [],
+
+      generationWindows: [],
       // Seeded empty on purpose, same reasoning as questionLogics above: a
       // teacher's observation of a real child is not something to fabricate
       // demo data for.
-      teacherObservationRecords: []
+      teacherObservationRecords: [],
+      // Same reasoning again -- a child's actual hints/scaffolding evidence
+      // isn't something to fabricate demo data for either.
+      attemptRecords: [],
+      // D1.6 Candidate skills and discovered skills (#481)
+      candidateSkills: [],
+      skills: []
     };
   }
 }

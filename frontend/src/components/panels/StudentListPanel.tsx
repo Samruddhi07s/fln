@@ -2,13 +2,15 @@
 // Issue #166: this panel is the canonical home for the "New Registration"
 // (Register New Student) action. The toggle button + form below live here
 // in the Students section; no register-style action exists on the dashboards.
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Student, User, UserRole } from '../../types';
 import { PageHeader, EmptyStudents } from './PanelShared';
 import { Users } from 'lucide-react';
 import { apiFetch } from '../../services/apiClient';
 import { parseCSVText } from '../RoleDashboards';
+import { useRosterFilters, resolveRestoredClassTab } from '../../hooks/useRosterFilters';
 import { CertificatesPanel } from './CertificatesPanel';
+import { buildCsv, downloadCsv } from '../../utils/csv';
 
 interface StudentListPanelProps {
   students: Student[];
@@ -16,6 +18,17 @@ interface StudentListPanelProps {
   currentUser: User;
   token: string;
   refreshStudents: () => void;
+}
+
+export function extractInvalidStudentRows(
+  invalidRows: any[],
+  parsedRows: any[],
+  csvResults: { results: any[] }
+): (string | number)[][] {
+  return invalidRows.map(row => {
+    const outcome = csvResults.results.find((r: any) => r.row === parsedRows.indexOf(row) + 1);
+    return [row.name, row.section, row.age, row.classGroup, row.aadharNumber, row.address, outcome ? outcome.reason : ''];
+  });
 }
 
 export const StudentListPanel: React.FC<StudentListPanelProps> = ({
@@ -47,6 +60,17 @@ export const StudentListPanel: React.FC<StudentListPanelProps> = ({
     );
   }, [students]);
   const [activeTab, setActiveTab] = useState<string>('all');
+  const { filters, setFilter, resetFilters } = useRosterFilters(currentUser.id, currentUser.role);
+  const restoredFiltersRef = useRef(false);
+  useEffect(() => {
+    if (restoredFiltersRef.current || studentsLoading) return;
+    restoredFiltersRef.current = true;
+    // Issue #532: `classTabs` are keyed classGroup|section and are not unique
+    // across schools, so the saved schoolId (not the tab key) is what decides
+    // whether this selection is still ours to restore. See
+    // resolveRestoredClassTab.
+    setActiveTab(resolveRestoredClassTab(filters, students) ?? 'all');
+  }, [studentsLoading, students, filters]);
   const visibleStudents = activeTab === 'all'
     ? students
     : students.filter(s => `${s.classGroup}|${s.section}` === activeTab);
@@ -210,32 +234,7 @@ export const StudentListPanel: React.FC<StudentListPanelProps> = ({
     if (invalidRows.length === 0) return;
 
     const headers = ['name', 'section', 'age', 'classGroup', 'aadharNumber', 'address', 'reason'];
-    const csvContent = [
-      headers.join(','),
-      ...invalidRows.map((row) => {
-        const outcome = csvResults.results.find((r: any) => r.row === parsedRows.indexOf(row) + 1);
-        const reason = outcome ? outcome.reason : '';
-        return [
-          `"${(row.name || '').replace(/"/g, '""')}"`,
-          `"${(row.section || '').replace(/"/g, '""')}"`,
-          `"${(row.age || '').replace(/"/g, '""')}"`,
-          `"${(row.classGroup || '').replace(/"/g, '""')}"`,
-          `"${(row.aadharNumber || '').replace(/"/g, '""')}"`,
-          `"${(row.address || '').replace(/"/g, '""')}"`,
-          `"${(reason || '').replace(/"/g, '""')}"`
-        ].join(',');
-      })
-    ].join('\n');
-
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.setAttribute('href', url);
-    link.setAttribute('download', 'invalid_students.csv');
-    link.style.visibility = 'hidden';
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+    downloadCsv('invalid_students.csv', buildCsv(headers, extractInvalidStudentRows(invalidRows, parsedRows, csvResults)));
   };
 
   return (
@@ -484,7 +483,7 @@ export const StudentListPanel: React.FC<StudentListPanelProps> = ({
         {classTabs.length > 1 && (
           <div className="flex gap-2 border-b border-slate-200 dark:border-slate-700 pb-px overflow-x-auto">
             <button
-              onClick={() => setActiveTab('all')}
+              onClick={() => { setActiveTab('all'); setFilter({ schoolId: null, classId: null, classGroup: null, section: null }); }}
               className={`px-4 py-2 text-sm font-display font-medium border-b-2 whitespace-nowrap transition-all ${
                 activeTab === 'all' ? 'border-slate-900 dark:border-white text-slate-900 dark:text-white font-semibold' : 'border-transparent text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200'
               }`}
@@ -497,7 +496,7 @@ export const StudentListPanel: React.FC<StudentListPanelProps> = ({
               return (
                 <button
                   key={key}
-                  onClick={() => setActiveTab(key)}
+                  onClick={() => { setActiveTab(key); setFilter({ schoolId: students.find(s => s.classGroup === c.classGroup && s.section === c.section)?.schoolId ?? null, classId: null, classGroup: c.classGroup, section: c.section }); }}
                   className={`px-4 py-2 text-sm font-display font-medium border-b-2 whitespace-nowrap transition-all ${
                     activeTab === key ? 'border-slate-900 dark:border-white text-slate-900 dark:text-white font-semibold' : 'border-transparent text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200'
                   }`}
@@ -506,10 +505,18 @@ export const StudentListPanel: React.FC<StudentListPanelProps> = ({
                 </button>
               );
             })}
+            {activeTab !== 'all' && (
+              <button
+                onClick={() => { resetFilters(); setActiveTab('all'); }}
+                className="ml-auto px-3 py-1.5 text-xs font-mono font-semibold text-slate-500 dark:text-slate-400 hover:text-red-600 dark:hover:text-red-400 whitespace-nowrap transition-colors cursor-pointer"
+              >
+                Reset Filters
+              </button>
+            )}
           </div>
         )}
 
-        <EmptyStudents students={visibleStudents} loading={studentsLoading} />
+        <EmptyStudents key={activeTab} students={visibleStudents} loading={studentsLoading} />
 
         {!studentsLoading && isTeacherOrVolunteer && visibleClassTabs.map(c => {
           const classStudents = students.filter(

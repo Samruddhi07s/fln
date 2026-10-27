@@ -352,7 +352,7 @@ export interface LevelSkillMapping {
   levelNumber: number;
   /**
    * The same level's identifier in the research docs' S-notation
-   * (`Research/fln_level_networks.md`, `Research/fln_proposed_levels.md`),
+   * (`Research/02-93-levels/framework-build/fln_level_networks.md`, `Research/02-93-levels/framework-build/fln_proposed_levels.md`),
    * e.g. "S3.5". Derived, not hand-maintained — see sCodeFor() below.
    * Issue #280: this is the "make the mapping available to the code" ask.
    * Which notation is canonical long-term is a separate, deliberate naming
@@ -369,6 +369,31 @@ export interface LevelSkillMapping {
   prerequisites: Prerequisite[];
   questionTypes: string[];
   evidence: string[];
+}
+
+// Ordered stage list — single source for the level -> stage registry (stageFor)
+// and for stage-order-dependent UI (SkillGraphPanel).
+export const STAGES = [
+  'Pre-school 1', 'Pre-school 2', 'Pre-school 3',
+  'Class 1', 'Class 2', 'Class 3', 'Class 4',
+] as const;
+
+// Canonical stage labels as the curriculum names them (backend curriculumMap.ts
+// and students.ts VALID_CLASS_GROUPS): "Pre-school 3" is the year before Class 1,
+// a.k.a. Balvatika (PR #517/#519), and the preschool spelling drops the hyphen.
+export const STAGE_LABELS: Record<LevelSkillMapping['stage'], string> = {
+  'Pre-school 1': 'Preschool 1',
+  'Pre-school 2': 'Preschool 2',
+  'Pre-school 3': 'Balvatika',
+  'Class 1': 'Class 1',
+  'Class 2': 'Class 2',
+  'Class 3': 'Class 3',
+  'Class 4': 'Class 4',
+};
+
+/** Canonical display label for any stage string, with a safe passthrough. */
+export function stageLabel(stage: string): string {
+  return STAGE_LABELS[stage as LevelSkillMapping['stage']] ?? stage;
 }
 
 /**
@@ -393,11 +418,9 @@ export interface Prerequisite {
 // backend/src/config/curriculumMap.ts's post-Balvatika registry (was 7, 10,
 // 10, 15, 19, 14, 18 -> 93 before this sync). Both stageFor() and sCodeFor()
 // derive from this same array so the two notations can't drift relative to
-// each other by construction. NOTE: no longer verified against
-// Research/fln_L_to_S_crosswalk.json / scripts/check-level-notation-drift.ts
-// as of this sync — that script and doc still reflect the pre-Balvatika
-// 93-level numbering and need their own update; flagged, not silently left
-// looking validated.
+// each other by construction. Synchronized and verified against
+// Research/02-93-levels/crosswalks/fln_L_to_S_crosswalk.json via scripts/check-level-notation-drift.ts
+// across all 109 levels.
 const STAGE_CUMULATIVE_BOUNDARIES = [8, 18, 46, 60, 77, 91, 109] as const;
 
 function stageIndexFor(n: number): number {
@@ -881,6 +904,7 @@ export const LEVEL_SKILL_MAP: LevelSkillMapping[] = [
       { levelId: 'L98', relationshipType: 'often_precedes',
         rationale: "Demoted from required_for_procedure (issue #279): perimeter/area computation is fundamentally addition/multiplication over given measurements — unit conversion is only needed for the subset of problems with mixed units, not the core skill." }] }),
 ];
+export const MAX_FLN_LEVEL = LEVEL_SKILL_MAP.length;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Sanity checks

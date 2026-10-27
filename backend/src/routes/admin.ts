@@ -1,7 +1,7 @@
 import express from 'express';
 import bcrypt from 'bcrypt';
 import { dbStore, UserRole, User } from '../db';
-import { getAuthUser, sanitizeUser } from '../auth';
+import { getAuthUser, sanitizeUser, requireSuperadmin } from '../auth';
 import {
   generateAdminId,
   generateDistrictAdminId,
@@ -31,7 +31,6 @@ function generateIdForRole(role: UserRole): string {
       throw new Error(`Unsupported generated user role: ${role}`);
   }
 }
-import { getAuthUser, sanitizeUser, requireSuperadmin } from '../auth';
 
 export function registerAdminRoutes(app: express.Express) {
   // Admin Creation (by Superadmin)
@@ -116,7 +115,7 @@ export function registerAdminRoutes(app: express.Express) {
       details: `Superadmin created account: ${name} (${role}) for scope ${stateCode || '*'}/${districtCode || '*'}/${blockCode || '*'}`
     });
 
-    res.json(newUser);
+    res.json(sanitizeUser(newUser));
   });
 
   app.get('/api/admin/coordinators', async (req, res) => {

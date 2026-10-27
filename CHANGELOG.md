@@ -4,6 +4,42 @@ All notable changes to this repository, grouped by date (newest first).
 Auto-curated from git history: pull-request merges and direct commits are listed;
 routine branch-sync merges are omitted. Regenerate with `gen_changelog.py`.
 
+## 2026-10-12 — Balvatika pipeline, pilot-safety fixes and contributor onboarding
+
+Everything merged between 2026-10-04 and 2026-10-12.
+
+**Balvatika pipeline**
+- **`feat`: generate worksheet questions from approved question templates (#805)** — `generateQuestionsForLevel` now reads a concept's approved templates first and falls back to the old generators only when none exist; observation-only templates never print on a student paper. Continues the earlier #647.
+- **`fix`: Balvatika worksheet PDF layout (#794, @Ritwij07)** — question text wraps to the page, 18 pt print, 4 questions per page, answer box below the text.
+- **`fix`: paginate personalized worksheet PDF questions (#631, @Ashish-Galaxy07)**.
+- **`feat`: Balvatika stage helper (#629, @jiyasingh951s-arch)** and **per-concept mastery rating with the 2-of-3 rule (#732, @lucky-pluton)**.
+- **`feat`: stage-specific authoring ZIP (#709, @KulkarniVidya)**, **template download with reference CSVs (#652)** and a **50-asset printable SVG library (#653)**.
+- **`fix`: all 10 question families in the template panel (#804)**, **assessment mode in question templates (#667, #711, #714, #716)**.
+- **`feat`: AttemptRecord evidence schema (#654, @Swasti2004)** and **choice error tags (#648, #693, #644)**.
+
+**Level count (109) and generation windows**
+- **`fix`: replace the hardcoded level ceiling (#607, #801)** — progress bars, dropdowns, target level and the question-bank audit use `MAX_FLN_LEVEL`.
+- **`feat`: time-bound worksheet generation workflow (#93, @Chirashrikarmakar)** and its tidy-up **(#723)**.
+
+**Roles, schools and data safety**
+- **`fix`: school onboarding rolls back on failure and the principal is not made class teacher (#717)**; geography codes validated **(#710, #764)**; **superadmin school onboarding (#662)**.
+- **`fix`: observation concept IDs validated (#790)**; observation routes **(#642)**.
+- **`fix`: overrides now update the fingerprint, archetype and root causes (#673)**.
+- **`fix`: analytics no longer shows another school when the user has no school ID (#719)** and defensive principal scoping with loading and empty states **(#661)**.
+- **`fix`: report the real MongoDB connection state (#775) and remove the dead Atlas connect form (#773)**; file-store fallback instead of hanging **(#580)**; collection names and analytics counters corrected **(#582)**.
+- **`fix`: vault configuration documented and missing settings logged at startup (#798)**.
+
+**Tests and CI**
+- **`test`: createStudentFromData validation (#586)**; **CI check that tests the merged result (#680)**; smoke baseline update **(#686)**.
+
+**Onboarding documents merged:** #226, #576, #708.
+
+## 2026-10-03 — Repo Health Check & Level-Notation Alignment
+
+- **`fix(curriculum)`: synchronize 109-level L-to-S notation crosswalk (#554)** — updated `Research/fln_L_to_S_crosswalk.json` to cover all 109 levels (`L1`–`L109` mapped to `S1.1`–`S7.18`) matching `frontend/src/data/skillProgressionMap.ts` and `POSITION_TO_SCODE`, resolving drift reported by `npm run check:level-notation-drift`. Updated `scripts/check-level-notation-drift.ts` for Windows ESM URL compatibility using `pathToFileURL`.
+- **`fix(roster)`: resolve teacher roster pagination bug (#553)** — fixed out-of-bounds pagination clamping in `Table.tsx`, added `key` props to force table page reset on tab switch, and updated `usePanelData.ts` to request `/api/students?all=1` for all roles.
+- **`chore(changelog)`: refresh CHANGELOG.md for repo health compliance (#554)** — added dated entry capturing recent system fixes and curriculum updates.
+
 ## 2026-09-16 — R-7 Certification Engine, pre-OCR scan-quality gate & Parikshak PR bots
 
 - **`feat(certification)`: SRS R-7 Certification Engine (#242)** — the certification pipeline landed end-to-end on the post-route-split backend: a pure eligibility engine (`backend/src/services/certificationEligibility.ts`) resolves a student to `eligible` / `not_eligible` / `insufficient_evidence` by ranking observed mastery (Strong > Satisfactory > Needs Practice) against the seeded mandatory competency requirements for the class (`backend/src/data/competencyRequirements.seed.json`, `backend/src/services/certificationCompetencyRequirements.ts`); `services/certificationRecords.ts` orchestrates recomputation per student (module-level promise chaining) and is triggered fire-and-forget from both `EvaluationReport` write paths (`backend/src/routes/evaluation.ts:1032`, `backend/src/routes/students.ts:1434`) so a certification recompute can never fail a worksheet submit; `services/certificationNotifications.ts` writes an in-app logbook entry and emails every SUPERADMIN/ADMIN user (nodemailer when `SMTP_HOST` is set, stdout payload otherwise); `backend/src/db.ts` gains the `certifications` / `competency_requirements` collections and their accessors (`getCertifications`, `getCertificationById`, `updateCertificationIfVersion` for optimistic `(id, version)` concurrency, `getLatestConceptMastery`); new routes `POST /api/certification/review/:certificationId` (confirm/revoke, revoke requires a reason, 409 on concurrent modification, `canAccessStudent` IDOR guard) and `GET /api/certifications` (admin queue vs per-student history); dependency-free assert scripts `backend/src/__checks__/certification.check.ts` and `certification-list.check.ts`; `backend/src/scripts/demo-cert.ts` walkthrough; UI — "Certification Reviews" sidebar entry for ADMIN/SUPERADMIN (`Layout.tsx`), review queue with a required-reason revoke modal (`CertificationReviewPanel.tsx`), per-student history card (`CertificationHistoryCard.tsx`), plus `Ideas/ONBOARDING-Sainikhil.md`.

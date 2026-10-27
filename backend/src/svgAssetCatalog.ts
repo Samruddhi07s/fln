@@ -14,6 +14,14 @@
 
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
+
+// ESM-safe replacement for CommonJS __dirname. The backend is ESM-only
+// (see backend/package.json "type": "module" and the tsx dev runner);
+// __dirname is not defined here. This was a runtime crash that surfaced
+// as the misleading "You may not have superadmin access" message in the
+// Question Intervention panel (see issue #670).
+const __dirname_esm = path.dirname(fileURLToPath(import.meta.url));
 
 export interface SvgThemeVariant {
   variantId: string;
@@ -41,7 +49,7 @@ interface Manifest {
  */
 function manifestPath(): string {
   const assetsDir = process.env.WORKSHEET_ASSETS_DIR
-    || path.resolve(__dirname, '../../frontend/public/worksheets');
+    || path.resolve(__dirname_esm, '../../frontend/public/worksheets');
   return path.resolve(assetsDir, '../assets/svg/questions/manifest.json');
 }
 
@@ -89,6 +97,21 @@ export function pickVariant(themeId: string, seed: string): SvgThemeVariant | un
   let hash = 0;
   for (let i = 0; i < seed.length; i++) hash = (hash * 31 + seed.charCodeAt(i)) >>> 0;
   return theme.variants[hash % theme.variants.length];
+}
+
+/**
+ * The markup of one artwork file, or null when it cannot be read.
+ *
+ * The file name comes from the manifest, but a manifest can be edited, so it is
+ * accepted only as a bare file name inside the artwork folder (no path parts).
+ */
+export function readVariantSvg(variant: SvgThemeVariant): string | null {
+  if (!/^[\w.-]+\.svg$/.test(variant.file) || variant.file.includes('..')) return null;
+  try {
+    return fs.readFileSync(path.resolve(path.dirname(manifestPath()), variant.file), 'utf-8');
+  } catch {
+    return null;
+  }
 }
 
 /**

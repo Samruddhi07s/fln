@@ -1,9 +1,11 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { ChevronDown, ChevronUp, ChevronsUpDown, Download, Search, SlidersHorizontal } from 'lucide-react';
+import { buildCsv, downloadCsv } from '../utils/csv';
 
 export interface Column<T> {
   header: string;
   accessor: keyof T | ((row: T) => React.ReactNode);
+  exportValue?: (row: T) => string | number;
   sortKey?: keyof T;
   filterKey?: keyof T;
   filterOptions?: string[];
@@ -17,6 +19,14 @@ interface TableProps<T> {
   searchKey?: keyof T | ((row: T) => string);
   loading?: boolean;
   emptyMessage?: string;
+}
+
+export function extractTableRows<T extends Record<string, any>>(data: T[], columns: Column<T>[]): (string | number)[][] {
+  return data.map(row => columns.map(col => {
+    if (col.exportValue) return col.exportValue(row);
+    if (typeof col.accessor === 'function') return row[col.sortKey as string] ?? row[col.filterKey as string] ?? '';
+    return row[col.accessor] ?? '';
+  }));
 }
 
 export function Table<T extends Record<string, any>>({
@@ -95,10 +105,18 @@ export function Table<T extends Record<string, any>>({
 
   // Pagination calculations
   const totalPages = Math.ceil(processedData.length / rowsPerPage) || 1;
+  const safePage = currentPage > totalPages ? 1 : currentPage;
+
+  useEffect(() => {
+    if (currentPage > totalPages) {
+      setCurrentPage(1);
+    }
+  }, [currentPage, totalPages]);
+
   const paginatedData = useMemo(() => {
-    const start = (currentPage - 1) * rowsPerPage;
+    const start = (safePage - 1) * rowsPerPage;
     return processedData.slice(start, start + rowsPerPage);
-  }, [processedData, currentPage, rowsPerPage]);
+  }, [processedData, safePage, rowsPerPage]);
 
   // Build a windowed page list (first, last, current +/- 1) with '...' gaps,
   // so wide datasets don't render one button per page (was 645 buttons at 6450 rows).
@@ -107,7 +125,7 @@ export function Table<T extends Record<string, any>>({
     const pages: (number | 'ellipsis')[] = [];
     const range: number[] = [];
 
-    for (let i = Math.max(2, currentPage - delta); i <= Math.min(totalPages - 1, currentPage + delta); i++) {
+    for (let i = Math.max(2, safePage - delta); i <= Math.min(totalPages - 1, safePage + delta); i++) {
       range.push(i);
     }
 
@@ -118,7 +136,7 @@ export function Table<T extends Record<string, any>>({
     if (totalPages > 1) pages.push(totalPages);
 
     return pages;
-  }, [currentPage, totalPages]);
+  }, [safePage, totalPages]);
 
   const handleFilterChange = (key: string, value: string) => {
     setActiveFilters(prev => ({ ...prev, [key]: value }));
@@ -128,30 +146,9 @@ export function Table<T extends Record<string, any>>({
   const handleExportCSV = () => {
     if (processedData.length === 0) return;
     
-    // Headers
-    const headers = columns.map(c => c.header).join(',');
-    
-    // Row content
-    const csvRows = processedData.map(row => {
-      return columns.map(col => {
-        let val = '';
-        if (typeof col.accessor === 'function') {
-          val = row[col.sortKey as string] || row[col.filterKey as string] || '';
-        } else {
-          val = row[col.accessor] || '';
-        }
-        return `"${String(val).replace(/"/g, '""')}"`;
-      }).join(',');
-    });
-
-    const csvContent = "data:text/csv;charset=utf-8," + [headers, ...csvRows].join("\n");
-    const encodedUri = encodeURI(csvContent);
-    const link = document.createElement("a");
-    link.setAttribute("href", encodedUri);
-    link.setAttribute("download", "exported_table_data.csv");
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+    const headers = columns.map(c => c.header);
+    const rows = extractTableRows(processedData, columns);
+    downloadCsv('exported_table_data.csv', buildCsv(headers, rows));
   };
 
   return (
@@ -295,16 +292,16 @@ export function Table<T extends Record<string, any>>({
       {totalPages > 1 && (
         <div className="flex items-center justify-between pt-2">
           <span className="text-xs font-mono text-slate-500 dark:text-slate-400">
-            Showing <strong className="text-slate-800 dark:text-slate-200">{((currentPage - 1) * rowsPerPage) + 1}</strong> to{' '}
+            Showing <strong className="text-slate-800 dark:text-slate-200">{((safePage - 1) * rowsPerPage) + 1}</strong> to{' '}
             <strong className="text-slate-800 dark:text-slate-200">
-              {Math.min(currentPage * rowsPerPage, processedData.length)}
+              {Math.min(safePage * rowsPerPage, processedData.length)}
             </strong>{' '}
             of <strong className="text-slate-800 dark:text-slate-200">{processedData.length}</strong> records
           </span>
           <div className="flex gap-1.5">
             <button
               onClick={() => setCurrentPage(prev => Math.max(prev - 1, 1))}
-              disabled={currentPage === 1}
+              disabled={safePage === 1}
               className="px-3 py-1.5 text-xs border border-slate-200 bg-white rounded-lg hover:bg-slate-50 disabled:opacity-50 disabled:cursor-not-allowed transition font-semibold cursor-pointer dark:bg-slate-900 dark:text-slate-300 dark:border-slate-700 dark:hover:bg-slate-800"
             >
               Previous
@@ -322,7 +319,7 @@ export function Table<T extends Record<string, any>>({
                   key={item}
                   onClick={() => setCurrentPage(item)}
                   className={`px-3 py-1.5 text-xs font-bold rounded-lg border transition cursor-pointer ${
-                    currentPage === item
+                    safePage === item
                       ? 'bg-indigo-600 text-white border-indigo-600 shadow-sm'
                       : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50 dark:bg-slate-900 dark:text-slate-300 dark:border-slate-700 dark:hover:bg-slate-800'
                   }`}
@@ -333,7 +330,7 @@ export function Table<T extends Record<string, any>>({
             )}
             <button
               onClick={() => setCurrentPage(prev => Math.min(prev + 1, totalPages))}
-              disabled={currentPage === totalPages}
+              disabled={safePage === totalPages}
               className="px-3 py-1.5 text-xs border border-slate-200 bg-white rounded-lg hover:bg-slate-50 disabled:opacity-50 disabled:cursor-not-allowed transition font-semibold cursor-pointer dark:bg-slate-900 dark:text-slate-300 dark:border-slate-700 dark:hover:bg-slate-800"
             >
               Next

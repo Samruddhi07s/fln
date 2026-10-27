@@ -1,12 +1,10 @@
 import express from 'express';
 import { dbStore, UserRole, Student, Question, AnswerSubmission, EvaluationReport, EvaluationReasoning, CYCLE_NAMES } from '../db';
-import { answersMatch } from '../answerMatching';
-import { classifyErrorType } from '../errorClassification';
-import { getAuthUser, canAccessStudent } from '../auth';
+import { answersMatch, matchesChoiceLetter } from '../answerMatching';
+import { getAuthUser, canAccessStudent, adminAreaIncludesSchool } from '../auth';
 import { generateDiagnosticPaper } from '../paperGenerator';
 import { generateQuestionsForLevel } from '../levelGenerator';
 import { evaluateAIDiagnostic } from '../gemini';
-import { runCertificationEligibility } from '../services/certificationRecords';
 import { invalidateFingerprintCache } from './misconceptions';
 import { assignStudentToArchetype } from '../studentArchetypeService';
 import { resolvePrerequisites, describeConcept, directPrerequisites } from '../competencyPrerequisites';
@@ -14,6 +12,12 @@ import { CURRICULUM_MAPPING } from '../config/curriculumMap';
 import { computeStudentDisplayId } from '../displayId';
 import { tokenizeAadhaar, formatAadhaarMask, AadhaarVaultTokenizeResult } from '../aadhaarVault';
 import { generateStudentId } from '../idGenerator';
+// #402 follow-up: extracted into ../rootCauseAnalysis.ts as
+// computeRootCauseAnalysis so routes/evaluation.ts can use the exact same
+// logic — see that module for the full history (FLN #458, #459). Re-exported
+// here under its original name so this file's own call site doesn't change.
+import { computeRootCauseAnalysis as readPipelineDetail } from '../rootCauseAnalysis';
+import { LEVEL_COUNT } from '../config/skillLevelMap';
 
 // ─── Response hygiene (Phase 2 hardening) ───────────────────────────────────
 // Vault references are internal-only: MongoDB and the internal Student model
@@ -25,95 +29,6 @@ export type PublicStudent = Omit<Student, 'aadhaarTokenId' | 'aadhaarIdentityId'
 function toPublicStudent(s: Student): PublicStudent {
   const { aadhaarTokenId: _tokenId, aadhaarIdentityId: _identityId, ...pub } = s;
   return pub;
-}
-
-/**
- * Lift the per-error detail out of a wrong-answer set.
- *
- * `run_pipeline.py` used to write `root_causes` with a real `error_type` per
- * question; that pipeline is never invoked from this backend (see FLN #458 —
- * it runs on a legacy class/phrase data model with no connection to the
- * current MongoDB-backed students), so `evalData` is always `{}` here now.
- * Rather than leave every diagnostic `unclassified`, high-confidence patterns
- * are detected directly from the submitted/expected answer pair — see
- * `classifyErrorType` in `errorClassification.ts`. Nothing here is guessed:
- * a shape that doesn't match a known pattern stays `unclassified` rather than
- * having a fabricated cause attached — a fabricated cause is indistinguishable
- * from a measured one once it is downstream (FLN #459).
- */
-function readPipelineDetail(
-  evalData: any,
-  questions: Question[],
-  answers: { [questionId: string]: string }
-): {
-  rootCauses?: EvaluationReport['rootCauses'];
-  levelsFailed?: number[];
-  prerequisitesToCheck?: string[];
-  performanceByDifficulty?: EvaluationReport['performanceByDifficulty'];
-} {
-  const norm = (value: unknown) => String(value ?? '').trim().toLowerCase();
-  const rawCauses: any[] = Array.isArray(evalData?.root_causes) ? evalData.root_causes : [];
-
-  // Per-question causes, where the pipeline produced them.
-  const keyed = rawCauses.filter(c => c && (c.question_id || c.questionId));
-  let rootCauses: EvaluationReport['rootCauses'] = keyed.map(c => {
-    const questionId = String(c.question_id ?? c.questionId);
-    const question = questions.find(q => q.question_id === questionId);
-    return {
-      questionId,
-      error: String(c.error ?? answers?.[questionId] ?? ''),
-      topic: String(c.topic ?? question?.topic ?? 'Unclassified'),
-      flnLevel: Number(c.fln_level ?? c.flnLevel ?? question?.source_level ?? 0),
-      errorType: String(c.error_type ?? c.errorType ?? 'unclassified'),
-      analysis: String(c.analysis ?? '')
-    };
-  });
-
-  if (rootCauses.length === 0) {
-    // A real pipeline verdict (when one exists) always wins over the local
-    // classifier — this is the fallback for the case that's true today,
-    // where evalData is always {} because nothing wires it in (FLN #458).
-    const overallType = evalData?.error_type ? String(evalData.error_type) : null;
-    const overallAnalysis = evalData?.root_cause ? String(evalData.root_cause) : '';
-    rootCauses = questions
-      .filter(q => norm(answers?.[q.question_id]) !== norm(q.answer))
-      .map(q => ({
-        questionId: q.question_id,
-        error: String(answers?.[q.question_id] ?? ''),
-        topic: q.topic || 'Unclassified',
-        flnLevel: Number(q.source_level ?? 0),
-        errorType: overallType ?? classifyErrorType(answers?.[q.question_id], q.answer),
-        analysis: overallAnalysis
-      }));
-  }
-
-  // Measured from the paper when the pipeline reported no breakdown of its own.
-  let performanceByDifficulty: EvaluationReport['performanceByDifficulty'] =
-    evalData?.performance_by_difficulty && typeof evalData.performance_by_difficulty === 'object'
-      ? evalData.performance_by_difficulty
-      : undefined;
-  if (!performanceByDifficulty) {
-    const tally: NonNullable<EvaluationReport['performanceByDifficulty']> = {};
-    for (const q of questions) {
-      const difficulty = q.difficulty || 'medium';
-      const cell = tally[difficulty] ?? { attempted: 0, correct: 0 };
-      cell.attempted++;
-      if (norm(answers?.[q.question_id]) === norm(q.answer)) cell.correct++;
-      tally[difficulty] = cell;
-    }
-    if (Object.keys(tally).length > 0) performanceByDifficulty = tally;
-  }
-
-  return {
-    rootCauses: rootCauses.length > 0 ? rootCauses : undefined,
-    levelsFailed: Array.isArray(evalData?.levels_failed)
-      ? evalData.levels_failed.map((n: any) => Number(n)).filter((n: number) => Number.isFinite(n))
-      : undefined,
-    prerequisitesToCheck: Array.isArray(evalData?.prerequisites_to_check)
-      ? evalData.prerequisites_to_check.map((p: any) => String(p))
-      : undefined,
-    performanceByDifficulty
-  };
 }
 
 export function registerStudentRoutes(app: express.Express) {
@@ -139,9 +54,18 @@ export function registerStudentRoutes(app: express.Express) {
           : DEFAULT_LIMIT);
 
     // server-side role scoping
-    let schoolScope: string | undefined;
+    let schoolScope: string | string[] | undefined;
     if (user.role === UserRole.TEACHER || user.role === UserRole.SCHOOL) {
       schoolScope = user.schoolId;
+    } else if (user.role === UserRole.ADMIN || user.role === UserRole.DISTRICT_ADMIN || user.role === UserRole.BLOCK_ADMIN) {
+      // A state, district or block admin sees only the schools of their own area
+      // (FLN #737); an account with no area code sees none.
+      const inArea = (await dbStore.getSchools()).filter(sc => adminAreaIncludesSchool(user, sc)).map(sc => sc.id);
+      if (inArea.length === 0) {
+        res.set('X-Total-Count', '0');
+        return res.json([]);
+      }
+      schoolScope = inArea;
     }
 
     // server-side search: `?q=foo` does a case-insensitive substring
@@ -162,7 +86,7 @@ export function registerStudentRoutes(app: express.Express) {
     // descending sort matches the same intent.
     const sort = String(req.query.sort ?? 'latest');
 
-    const opts: { limit?: number; offset?: number; schoolId?: string; sort?: 'latest'; q?: string } = {
+    const opts: { limit?: number; offset?: number; schoolId?: string | string[]; sort?: 'latest'; q?: string } = {
       offset: requestedOffset,
     };
     if (limit > 0) opts.limit = limit;
@@ -198,7 +122,7 @@ export function registerStudentRoutes(app: express.Express) {
     // panel can show "Page 1 of N matching 'foo'" with the right N.
     // Done in the DB (not from `masked.length`) because masked only
     // holds the current page.
-    const countOpts: { schoolId?: string; q?: string } = {};
+    const countOpts: { schoolId?: string | string[]; q?: string } = {};
     if (schoolScope) countOpts.schoolId = schoolScope;
     if (search) countOpts.q = rawQ;
     const total = await dbStore.countStudents(countOpts);
@@ -629,7 +553,7 @@ export function registerStudentRoutes(app: express.Express) {
     const { currentLevel, currentSubLevel, targetLevel, levelHistory } = req.body;
     const student = await dbStore.getStudentById(req.params.id);
     if (!student) return res.status(404).json({ error: 'Student not found.' });
-    if (!canAccessStudent(user, student)) return res.status(403).json({ error: 'Forbidden.' });
+    if (!(await canAccessStudent(user, student))) return res.status(403).json({ error: 'Forbidden.' });
 
     await dbStore.updateStudent(student.id, {
       currentLevel: currentLevel !== null && currentLevel !== undefined ? Number(currentLevel) : null,
@@ -650,7 +574,7 @@ export function registerStudentRoutes(app: express.Express) {
 
     const student = await dbStore.getStudentById(req.params.id);
     if (!student) return res.status(404).json({ error: 'Student not found.' });
-    if (!canAccessStudent(user, student)) return res.status(403).json({ error: 'Forbidden.' });
+    if (!(await canAccessStudent(user, student))) return res.status(403).json({ error: 'Forbidden.' });
 
     const {
       gender, dob, guardianName, guardianRelation, guardianContact, address,
@@ -683,7 +607,7 @@ export function registerStudentRoutes(app: express.Express) {
 
     const student = await dbStore.getStudentById(req.params.id);
     if (!student) return res.status(404).json({ error: 'Student not found.' });
-    if (!canAccessStudent(user, student)) return res.status(403).json({ error: 'Forbidden.' });
+    if (!(await canAccessStudent(user, student))) return res.status(403).json({ error: 'Forbidden.' });
 
     // Parse class number from classGroup (e.g. "Class 2" -> 2)
     const classMatch = student.classGroup.match(/\d+/);
@@ -713,12 +637,12 @@ export function registerStudentRoutes(app: express.Express) {
       const startLevel = (classNumber - 1) * 12 + 1;
       questions = [];
       for (let lvl = startLevel; lvl < startLevel + 8; lvl++) {
-        const lvlQuestions = generateQuestionsForLevel(Math.min(lvl, 108), 0);
+        const lvlQuestions = await generateQuestionsForLevel(Math.min(lvl, LEVEL_COUNT), 0);
         lvlQuestions.forEach(q => {
           questions.push({
             ...q,
             question_id: `DIAG_${lvl}_${q.question_id}`,
-            source_level: Math.min(lvl, 108)
+            source_level: Math.min(lvl, LEVEL_COUNT)
           });
         });
       }
@@ -726,7 +650,7 @@ export function registerStudentRoutes(app: express.Express) {
     }
 
     res.json({
-      student,
+      student: toPublicStudent(student),
       diagnosticPaper: {
         id: 'diag_' + student.id + '_' + Date.now(),
         studentId: student.id,
@@ -785,7 +709,7 @@ export function registerStudentRoutes(app: express.Express) {
     let { questions, answers } = req.body;
     const student = await dbStore.getStudentById(req.params.id);
     if (!student) return res.status(404).json({ error: 'Student not found.' });
-    if (!canAccessStudent(user, student)) return res.status(403).json({ error: 'Forbidden.' });
+    if (!(await canAccessStudent(user, student))) return res.status(403).json({ error: 'Forbidden.' });
 
     // Parse class number from classGroup (e.g. "Class 2" -> 2)
     const classMatch = student.classGroup.match(/\d+/);
@@ -820,7 +744,7 @@ export function registerStudentRoutes(app: express.Express) {
         positional[key] = String(value);
         continue;
       }
-      const posMatch = /^Q(\d+)$/i.exec(key.trim());
+      const posMatch = /^q_?(\d+)$/i.exec(key.trim());
       const q = posMatch ? questions[parseInt(posMatch[1], 10) - 1] : undefined;
       if (q) {
         positional[q.question_id] = String(value);
@@ -845,7 +769,7 @@ export function registerStudentRoutes(app: express.Express) {
               positional[key] = String(value);
               continue;
             }
-            const posMatch = /^Q(\d+)$/i.exec(key.trim());
+            const posMatch = /^q_?(\d+)$/i.exec(key.trim());
             const q = posMatch ? akQuestions[parseInt(posMatch[1], 10) - 1] : undefined;
             if (q) {
               positional[q.question_id || q.qid || ''] = String(value);
@@ -868,7 +792,7 @@ export function registerStudentRoutes(app: express.Express) {
     }
     if (Object.keys(positional).length === 0) {
       return res.status(400).json({
-        error: `None of the ${Object.keys(answers).length} answer key(s) match this student's paper. Expected question ids like "${questions[0].question_id}" or positions "Q1".."Q${questions.length}".`
+        error: `None of the ${Object.keys(answers).length} answer key(s) match this student's paper. Expected question ids like "${questions[0].question_id}" or positions "Q1".."Q${questions.length}" (also "q_1".."q_${questions.length}").`
       });
     }
     if (remapped > 0) console.log(`[baseline] remapped ${remapped} positional answer key(s) for ${student.id}`);
@@ -896,7 +820,7 @@ export function registerStudentRoutes(app: express.Express) {
         });
       }
       return res.json({
-        student,
+        student: toPublicStudent(student),
         evaluation: { score: existingReport.score, recommendedLevel: existingReport.recommendedLevel, narrative: existingReport.narrative },
         report: existingReport,
         alreadySubmitted: true
@@ -946,7 +870,7 @@ export function registerStudentRoutes(app: express.Express) {
         // handwriting, and "07" vs "7" is notation rather than a wrong
         // answer. Getting this wrong does not just lose a mark, it lowers
         // the child's placement. See backend/src/answerMatching.ts.
-        isCorrect: answersMatch(answers[q.question_id], q.answer),
+        isCorrect: answersMatch(answers[q.question_id], q.answer) || matchesChoiceLetter(answers[q.question_id], q),
         sourceLevel: Number.isFinite(srcLevel) ? srcLevel : NaN,
       };
     });
@@ -1129,16 +1053,30 @@ export function registerStudentRoutes(app: express.Express) {
       levelHistory
     });
 
-    // Concept mastery by broad topic band. Coarse (four fixed bands keyed to
-    // recommendedLevel thresholds) rather than derived from which questions
-    // were actually missed — a real per-topic breakdown needs #413's error
-    // clustering, not something to fake here in the meantime.
-    const conceptMastery: { [topic: string]: "Strong" | "Needs Practice" | "Satisfactory" } = {
-      'Number Sense': recommendedLevel >= 15 ? 'Strong' : 'Needs Practice',
-      'Shapes': recommendedLevel >= 25 ? 'Strong' : 'Needs Practice',
-      'Fractions': recommendedLevel >= 35 ? 'Strong' : 'Needs Practice',
-      'Operations': recommendedLevel >= 12 ? 'Strong' : 'Needs Practice'
-    };
+    // Concept mastery per strand, from how the student actually did on this
+    // paper's questions in that strand: >= 80% correct is Strong, >= 60% is
+    // Satisfactory, anything lower is Needs Practice. (It used to compare
+    // recommendedLevel against four fixed thresholds that every class's level
+    // range now exceeds, so every strand came out Strong regardless of score —
+    // #577.)
+    const strandOf = (r: (typeof questionResults)[number]) =>
+      CURRICULUM_MAPPING[r.sourceLevel]?.strand
+      || (r.q.conceptId ? describeConcept(r.q.conceptId)?.strand : undefined)
+      || r.q.topic
+      || 'General Mathematics';
+    const strandOutcomes = new Map<string, { correct: number; total: number }>();
+    for (const r of questionResults) {
+      const strand = strandOf(r);
+      const o = strandOutcomes.get(strand) ?? { correct: 0, total: 0 };
+      o.total += 1;
+      if (r.isCorrect) o.correct += 1;
+      strandOutcomes.set(strand, o);
+    }
+    const conceptMastery: { [topic: string]: "Strong" | "Needs Practice" | "Satisfactory" } = {};
+    for (const [strand, { correct, total }] of strandOutcomes) {
+      const pct = total > 0 ? (correct / total) * 100 : 0;
+      conceptMastery[strand] = pct >= 80 ? 'Strong' : pct >= 60 ? 'Satisfactory' : 'Needs Practice';
+    }
 
     // Persist what the child actually wrote, alongside the verdict.
     //
@@ -1224,24 +1162,19 @@ export function registerStudentRoutes(app: express.Express) {
 
     // A concept counts as failed only when the student got none of its
     // questions right. Per-question correctness is the only source of truth
-    // here — deliberately NOT the heuristic conceptMastery above, which is
-    // derived from recommendedLevel thresholds and can flag a concept as weak
-    // even when every question was answered correctly.
+    // here — conceptMastery above is per strand, which is coarser than the
+    // per-concept grouping a failed concept needs.
     const failedConceptIds: string[] = [];
     for (const [conceptId, { correct }] of conceptOutcomes) {
       if (correct === 0) failedConceptIds.push(conceptId);
     }
 
-    // Override conceptMastery for the PASS case. The level-threshold heuristic
-    // above would otherwise mark every strand as "Needs Practice" because the
-    // student is placed at Level 2 — which directly contradicts the
-    // demonstrated mastery.
+    // PASS case: every strand on the paper is Strong. Per-strand scoring
+    // already gives 100% everywhere here; this keeps the guarantee explicit
+    // and uses the same strandOf() so the keys always match.
     if (allCorrect) {
       for (const r of questionResults) {
-        const cfg = CURRICULUM_MAPPING[r.q.source_level || 0];
-        if (cfg?.strand) {
-          conceptMastery[cfg.strand] = 'Strong';
-        }
+        conceptMastery[strandOf(r)] = 'Strong';
       }
     }
 
@@ -1254,7 +1187,7 @@ export function registerStudentRoutes(app: express.Express) {
     //
     //   question result (correct / incorrect, from the submitted answers)
     //     -> q.conceptId          (skip the question when absent)
-    //     -> CONCEPT_PREREQUISITES (Research/fln_level_networks.md, prereq edges only)
+    //     -> CONCEPT_PREREQUISITES (Research/02-93-levels/framework-build/fln_level_networks.md, prereq edges only)
     //     -> prerequisiteLearningPath
     //
     // There is no level-number arithmetic, no topic/subtopic string matching and
@@ -1431,8 +1364,9 @@ export function registerStudentRoutes(app: express.Express) {
       console.error('[archetype] Failed to assign student to misconception archetype:', error);
     }
 
-    // Fire-and-forget: re-evaluate certification eligibility.
-    runCertificationEligibility(student);
+    // Issue #845: certification eligibility is NOT evaluated on diagnostic
+    // submissions. Only End-of-year worksheet submissions trigger it
+    // (see routes/evaluation.ts).
 
     await dbStore.addLog({
       id: 'log_' + Date.now(),
@@ -1460,7 +1394,7 @@ export function registerStudentRoutes(app: express.Express) {
       });
     }
 
-    res.json({ student, evaluation: { score, recommendedLevel, narrative }, report });
+    res.json({ student: toPublicStudent(student), evaluation: { score, recommendedLevel, narrative }, report });
   };
 
   app.post('/api/students/:id/diagnostic/submit', submitDiagnostic('diagnostic'));

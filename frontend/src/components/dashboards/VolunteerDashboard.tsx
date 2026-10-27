@@ -8,6 +8,7 @@ import { User, Student, ClassGroup, DashboardProps } from '../../types';
 import { DiagnosticWorkflow } from '../DiagnosticWorkflow';
 import { BaselineUpload } from '../BaselineUpload';
 import { SkillGraphPanel } from '../SkillGraphPanel';
+import { LEVEL_SKILL_MAP } from '../../data/skillProgressionMap';
 import { Table, Column } from '../Table';
 import { LevelBadge } from '../RoleDashboards';
 import { DashboardSkeleton } from '../ui/DashboardSkeleton';
@@ -143,7 +144,7 @@ export const VolunteerDashboard: React.FC<DashboardProps> = ({ user, token }) =>
             onClick={() => setShowSkillGraph(true)}
             className="bg-white dark:bg-slate-900 hover:bg-zinc-50 dark:hover:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 text-zinc-700 dark:text-zinc-200 font-mono text-xs font-semibold px-4 py-2.5 rounded-lg transition-colors cursor-pointer"
           >
-            🧠 Skill Progression (93 levels)
+            🧠 Skill Progression ({LEVEL_SKILL_MAP.length} levels)
           </button>
 
         </div>
@@ -180,7 +181,7 @@ export const VolunteerDashboard: React.FC<DashboardProps> = ({ user, token }) =>
           {/* Issue #166: Diagnostic Paper Generator + Level-Wise Paper Generator
               + Exam Worksheets Engine cards removed from this dashboard. They
               now live in:
-                - Assessment -> Diagnostic Test (BulkDiagnosticWorkflow + 93 FLN
+                - Assessment -> Diagnostic Test (BulkDiagnosticWorkflow + FLN
                   Framework modal — DiagnosticTestPanel.tsx)
                 - Worksheets (Level-Wise batch generator + Open Personalization
                   Portal + ICR Answer Sheet Scanner launchers — WorksheetsPanel.tsx)
@@ -195,18 +196,23 @@ export const VolunteerDashboard: React.FC<DashboardProps> = ({ user, token }) =>
             <div className="p-4">
               {(() => {
                 const studentColumns: Column<Student>[] = [
-                  { header: 'ID', accessor: (s) => s.displayId || s.id, sortKey: 'id', className: 'font-mono text-xs text-slate-400 dark:text-slate-500' },
+                  { header: 'ID', accessor: (s) => s.displayId || s.id, exportValue: (s) => s.displayId || s.id, sortKey: 'id', className: 'font-mono text-xs text-slate-400 dark:text-slate-500' },
                   { header: 'Student Name', accessor: 'name', sortKey: 'name', className: 'font-medium text-slate-900 dark:text-slate-100' },
                   {
                     header: 'Current Level',
-                    accessor: (s) => <LevelBadge level={s.currentLevel} subLevel={s.currentSubLevel} />
+                    accessor: (s) => <LevelBadge level={s.currentLevel} subLevel={s.currentSubLevel} />,
+                    exportValue: (s) => s.currentLevel ?? ''
                   },
                   {
                     header: 'Target Level',
-                    accessor: (s) => <span className="font-mono text-slate-500 dark:text-slate-400 text-xs">Level {s.targetLevel}</span>
+                    accessor: (s) => <span className="font-mono text-slate-500 dark:text-slate-400 text-xs">Level {s.targetLevel}</span>,
+                    exportValue: (s) => s.targetLevel != null ? `Level ${s.targetLevel}` : ''
                   },
                   {
                     header: 'Diagnostic Status',
+                    exportValue: (s) => s.levelHistory.length === 0
+                      ? 'Pending'
+                      : `${s.levelHistory[s.levelHistory.length - 1].reason} Done`,
                     accessor: (s) => s.levelHistory.length === 0 ? (
                       <div className="flex items-center gap-1.5">
                         <button
