@@ -1,5 +1,5 @@
 /**
- * A Balvatika paper carries 10 questions, never a placeholder, never a repeat (#760, #359).
+ * A Balvatika paper carries 5 questions, never a placeholder, never a repeat (#760, #359).
  *
  * Hermetic: the one database read (`dbStore.getQuestionTemplatesByConcept`) is
  * mocked, so no MongoDB is needed. Run with:
@@ -72,9 +72,9 @@ function assertDistinct(questions: Array<{ question: string }>) {
   assert.equal(new Set(texts).size, texts.length, 'a paper must not carry the same question twice');
 }
 
-test('a Balvatika level (19-46) carries 10 questions, every other level 4', () => {
-  assert.equal(QUESTIONS_PER_BALVATIKA_LEVEL, 10);
-  for (const level of [19, 28, 46]) assert.equal(questionsPerLevel(level), 10, `level ${level}`);
+test('a Balvatika level (19-46) carries 5 questions, every other level 4', () => {
+  assert.equal(QUESTIONS_PER_BALVATIKA_LEVEL, 5);
+  for (const level of [19, 28, 46]) assert.equal(questionsPerLevel(level), 5, `level ${level}`);
   for (const level of [1, 18, 47, 109]) assert.equal(questionsPerLevel(level), QUESTIONS_PER_LEVEL, `level ${level}`);
 });
 
@@ -113,10 +113,10 @@ test('generateQuestionsByConcept honours `count` and keeps the default of 4', ()
   assertDistinct(six);
 });
 
-test('generateQuestionsForLevel: a Balvatika level with templates gives 10 distinct, non-placeholder questions', async t => {
+test('generateQuestionsForLevel: a Balvatika level with templates gives 5 distinct, non-placeholder questions', async t => {
   templatesFor(t, id => [countingTemplate(id)]);
   const questions = await generateQuestionsForLevel(19, 0);
-  assert.equal(questions.length, 10);
+  assert.equal(questions.length, QUESTIONS_PER_BALVATIKA_LEVEL);
   assertDistinct(questions);
   for (const q of questions) assert.doesNotMatch(q.question, PLACEHOLDER);
 });

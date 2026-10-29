@@ -8,11 +8,13 @@ export const QUESTIONS_PER_LEVEL = 4;
 
 /**
  * Balvatika is levels 19-46 (stage 3 plus S4.12, S4.13, S5.9, S5.13). A Balvatika
- * level is assessed with 8-10 questions (#594), so a paper for one carries 10.
+ * level is assessed with 5 questions: the curriculum reviewer's ruling on the
+ * Balvatika question bank (2026-10-22) is "5 is enough for each concept", scored
+ * 0-1 Beginner, 2-3 Intermediate, 4-5 Proficient. (#594's earlier 8-10 is superseded.)
  */
 export const BALVATIKA_FIRST_LEVEL = 19;
 export const BALVATIKA_LAST_LEVEL = 46;
-export const QUESTIONS_PER_BALVATIKA_LEVEL = 10;
+export const QUESTIONS_PER_BALVATIKA_LEVEL = 5;
 
 /** How many questions a paper for `level` carries. */
 export function questionsPerLevel(level: number): number {
