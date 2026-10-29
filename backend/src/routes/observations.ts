@@ -5,6 +5,7 @@ import { canAccessStudent, getAuthUser } from '../auth';
 import { getLevelForConcept } from '../config/curriculumMap';
 
 const OBSERVATION_RATINGS = ['Proficient', 'Progressive', 'Beginner'] as const;
+const OBSERVATION_STRATEGIES = ['fingers', 'counters', 'mental', 'written'] as const;
 
 function isValidCycle(cycle: unknown): cycle is typeof CYCLE_NAMES[number] {
   return typeof cycle === 'string' && (CYCLE_NAMES as readonly string[]).includes(cycle);
@@ -72,7 +73,7 @@ export function registerObservationRoutes(app: express.Express) {
       return res.status(403).json({ error: 'Account suspended.' });
     }
 
-    const { studentId, conceptId, classId, cycle, rating, notYetAssessed } = req.body ?? {};
+    const { studentId, conceptId, classId, cycle, rating, notYetAssessed, selfCorrected, strategyUsed } = req.body ?? {};
     if (
       typeof studentId !== 'string' || !studentId.trim() ||
       typeof conceptId !== 'string' || !conceptId.trim() ||
@@ -84,6 +85,14 @@ export function registerObservationRoutes(app: express.Express) {
       return res.status(400).json({
         error: 'Required fields: studentId, conceptId, classId, valid cycle, valid rating, and boolean notYetAssessed.'
       });
+    }
+
+    // Optional fields: absent is fine, present must be valid.
+    if (selfCorrected !== undefined && typeof selfCorrected !== 'boolean') {
+      return res.status(400).json({ error: 'selfCorrected must be true or false.' });
+    }
+    if (strategyUsed !== undefined && !(OBSERVATION_STRATEGIES as readonly unknown[]).includes(strategyUsed)) {
+      return res.status(400).json({ error: `strategyUsed must be one of ${OBSERVATION_STRATEGIES.join(', ')}.` });
     }
 
     const concept = conceptId.trim();
@@ -108,6 +117,8 @@ export function registerObservationRoutes(app: express.Express) {
 
       const existing = await dbStore.getObservationRecordsForStudent(student.id, cycle);
       const priorRecord = existing.find(record => record.conceptId === concept);
+      const carriedSelfCorrected: boolean | undefined = selfCorrected ?? priorRecord?.selfCorrected;
+      const carriedStrategy: TeacherObservationRecord['strategyUsed'] = strategyUsed ?? priorRecord?.strategyUsed;
       const now = new Date().toISOString();
       const record: TeacherObservationRecord = {
         id: priorRecord?.id ?? `obs_${randomUUID()}`,
@@ -120,6 +131,10 @@ export function registerObservationRoutes(app: express.Express) {
         cycle,
         rating,
         notYetAssessed,
+        // Only set when there is a value, so a record never carries an empty key; an update
+        // that does not send a field keeps what the earlier save recorded.
+        ...(carriedSelfCorrected !== undefined && { selfCorrected: carriedSelfCorrected }),
+        ...(carriedStrategy !== undefined && { strategyUsed: carriedStrategy }),
         observedAt: now,
         createdAt: priorRecord?.createdAt ?? now,
         updatedAt: now
