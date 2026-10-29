@@ -51,6 +51,8 @@
     "test:paper-type-config": "tsx --test tests/paper-type-config.test.ts",
     "test:choice-letter-answers": "tsx --test tests/choice-letter-answers.test.ts",
     "test:worksheet-layout-rules": "tsx --test tests/worksheet-layout-rules.test.ts",
+    "test:observation-sheet": "tsx --test tests/observation-sheet.test.ts",
+    "test:observation-sheet-route": "tsx --test tests/observation-sheet-route.test.ts",
     "test:student-history": "tsx --test tests/student-history.test.ts",
     "test:worksheet-content": "tsx --test tests/worksheet-content.test.ts",
     "test:svg-pdf": "tsx --test tests/svg-pdf.test.ts",
