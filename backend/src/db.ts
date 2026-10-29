@@ -1685,7 +1685,7 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
       };
     }
 
-    const sumLevel = filteredStudents.reduce((acc, s) => acc + s.currentLevel, 0);
+    const sumLevel = filteredStudents.reduce((acc, s) => acc + (s.currentLevel ?? 0), 0);
     const avgLevel = Math.round((sumLevel / count) * 10) / 10;
     const certified = filteredStudents.filter(s => s.currentLevel >= 5).length;
     const certificationRate = Math.round((certified / count) * 100);

@@ -17,11 +17,15 @@
     "build:backend": "npm run build --workspace @fln/backend",
     "start": "npm run start --workspace @fln/backend",
     "lint": "npm run lint --workspaces --if-present",
+    "report:calibration": "tsx scripts/certification-calibration.ts",
     "seed:question-bank": "npm run seed:question-bank --workspace @fln/backend",
     "check:level-notation-drift": "tsx scripts/check-level-notation-drift.ts"
   },
   "dependencies": {
     "mongodb": "^7.5.0",
     "mongoose": "^9.7.4"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6"
   }
 }
