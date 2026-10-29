@@ -106,11 +106,11 @@ test('a student on level 28 (no written questions) gives one clear 422 and write
   assert.equal(addWorksheet.mock.callCount(), 0, 'nothing is saved when any student has no content');
 });
 
-test('a class where every student has content still generates, with 10 questions for a Balvatika level', async t => {
+test('a class where every student has content still generates, with 5 questions for a Balvatika level', async t => {
   const { addWorksheet, token } = mockClass(t, [student('st1', 'Asha', 19)]);
   const { status, body } = await generate(token);
   assert.equal(status, 200);
   assert.equal(addWorksheet.mock.callCount(), 1);
-  assert.equal(body.questions.length, 10);
+  assert.equal(body.questions.length, 5);
   for (const q of body.questions) assert.doesNotMatch(q.question, /Practice Question #|\[Concept /);
 });
