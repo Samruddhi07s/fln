@@ -8,10 +8,15 @@ import { dbStore, EvaluationReport, Student, AnswerSubmission, UserRole, CYCLE_N
 import { getAuthUser, canAccessStudent } from '../auth';
 import { evaluateAIWorksheet } from '../gemini';
 import { PYTHON_BIN, AI_SERVICES_DIR } from '../config';
+import { runCertificationEligibility } from '../services/certificationRecords';
 import { invalidateFingerprintCache } from './misconceptions';
 import { assignStudentToArchetype } from '../studentArchetypeService';
 import { CURRICULUM_MAPPING } from '../config/curriculumMap';
 import { directPrerequisites, describeConcept } from '../competencyPrerequisites';
+import { analyzeScanQuality } from '../scanQuality';
+import { calculateStandardAdvancement } from '../gradeLevelCalculator';
+import { computeRootCauseAnalysis } from '../rootCauseAnalysis';
+import { matchesChoiceLetter } from '../answerMatching';
 
 export function registerEvaluationRoutes(app: express.Express) {
 
@@ -46,12 +51,12 @@ export function registerEvaluationRoutes(app: express.Express) {
   };
 
   // Admin endpoint: configure (or clear) a cloud OCR API key.
-  // Restricted to superadmin / admin roles. Returns {provider, configured}.
+  // Restricted to superadmin role only. Returns {provider, configured}.
   app.post('/api/icr/cloud-config', async (req, res) => {
     const user = getAuthUser(req);
     if (!user) return res.status(401).json({ error: 'Unauthorized' });
-    if (user.role !== 'superadmin' && user.role !== 'admin') {
-      return res.status(403).json({ error: 'Admin role required.' });
+    if (user.role !== UserRole.SUPERADMIN) {
+      return res.status(403).json({ error: 'Superadmin role required.' });
     }
     const { provider, apiKey } = req.body || {};
     // Single OCR model: ollama-gemma4. Other providers (google, aws,
@@ -112,213 +117,6 @@ export function registerEvaluationRoutes(app: express.Express) {
     const t0 = Date.now();
 
     try {
-      // ===== Google Cloud Vision =====
-      if (provider === 'google') {
-        const visionRes = await fetch(
-          'https://vision.googleapis.com/v1/images:annotate?key=' + encodeURIComponent(apiKey),
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              requests: [{
-                image: { content: base64Body },
-                features: [{ type: 'DOCUMENT_TEXT_DETECTION' }],
-                imageContext: { languageHints: ['en'] },
-              }],
-            }),
-          }
-        );
-        const visionJson = await visionRes.json();
-        if (!visionRes.ok) {
-          const msg = (visionJson && visionJson.error && visionJson.error.message) ||
-            (visionJson && visionJson.responses && visionJson.responses[0] && visionJson.responses[0].error && visionJson.responses[0].error.message) ||
-            ('Google Vision HTTP ' + visionRes.status);
-          return { status: 502, body: { error: 'Google Vision: ' + msg } };
-        }
-        const resp = visionJson && visionJson.responses && visionJson.responses[0];
-        if (resp && resp.error) {
-          return { status: 502, body: { error: 'Google Vision: ' + resp.error.message } };
-        }
-        const fullText = (resp && resp.fullTextAnnotation && resp.fullTextAnnotation.text) || '';
-        const blocks = (resp && resp.fullTextAnnotation && resp.fullTextAnnotation.pages && resp.fullTextAnnotation.pages[0] && resp.fullTextAnnotation.pages[0].blocks) || [];
-        const tokens = [];
-        for (let bi = 0; bi < blocks.length; bi++) {
-          const paras = blocks[bi].paragraphs || [];
-          for (let pi = 0; pi < paras.length; pi++) {
-            const words = paras[pi].words || [];
-            for (let wi = 0; wi < words.length; wi++) {
-              const word = words[wi];
-              const syms = word.symbols || [];
-              let wtext = '';
-              for (let si = 0; si < syms.length; si++) wtext += (syms[si].text || '');
-              if (!wtext.trim()) continue;
-              const verts = (word.boundingBox && word.boundingBox.vertices) || [];
-              const bbox = [];
-              for (let vi = 0; vi < verts.length; vi++) {
-                bbox.push([verts[vi].x || 0, verts[vi].y || 0]);
-              }
-              if (bbox.length === 0) {
-                bbox.push([0, 0], [0, 0], [0, 0], [0, 0]);
-              }
-              tokens.push({
-                text: wtext,
-                confidence: typeof word.confidence === 'number' ? word.confidence : 0.9,
-                bbox: bbox,
-              });
-            }
-          }
-        }
-        return {
-          status: 200, body: {
-            success: true,
-            provider: 'google',
-            ocrEngine: 'Google Cloud Vision (DOCUMENT_TEXT_DETECTION)',
-            rawOcrText: fullText,
-            extractedTokens: tokens,
-            processingTimeMs: Date.now() - t0,
-          }
-        };
-      }
-
-      // ===== MiniMax (vision-capable chat completion) =====
-      if (provider === 'minimax') {
-        const imageDataUrl = 'data:image/jpeg;base64,' + base64Body;
-        const ocrPrompt =
-          'You are an OCR engine. Read this handwritten answer sheet and ' +
-          'extract every visible mark. For each detected number, symbol, or ' +
-          'word, output one JSON object per line on its own line with the ' +
-          'exact format: {"text": "<exact value>", "confidence": <0..1>}. ' +
-          'Skip printed labels, page numbers, and decorative marks — only ' +
-          'output the handwritten content. Do not include any explanation ' +
-          'or commentary. Output ONLY the JSON lines.';
-        const minimaxRes = await fetch(
-          'https://api.MiniMax.chat/v1/chat/completions',
-          {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': 'Bearer ' + apiKey,
-            },
-            body: JSON.stringify({
-              model: 'minimax-m3',
-              messages: [{
-                role: 'user',
-                content: [
-                  { type: 'text', text: ocrPrompt },
-                  { type: 'image_url', image_url: { url: imageDataUrl } },
-                ],
-              }],
-              max_tokens: 4096,
-              temperature: 0,
-            }),
-          }
-        );
-        const minimaxJson = await minimaxRes.json();
-        if (!minimaxRes.ok) {
-          const msg = (minimaxJson && minimaxJson.error && minimaxJson.error.message) ||
-            (minimaxJson && minimaxJson.message) ||
-            ('MiniMax HTTP ' + minimaxRes.status);
-          return { status: 502, body: { error: 'MiniMax: ' + msg } };
-        }
-        const reply = (minimaxJson && minimaxJson.choices && minimaxJson.choices[0] && minimaxJson.choices[0].message && minimaxJson.choices[0].message.content) || '';
-        const cleaned = String(reply).replace(/\`\`\`json\n?/gi, '').replace(/\`\`\`\n?/g, '').trim();
-        const tokens = [];
-        const lines = cleaned.split('\n');
-        let yPos = 0;
-        for (let li = 0; li < lines.length; li++) {
-          const trimmed = lines[li].trim();
-          if (!trimmed) continue;
-          let parsed = null;
-          try { parsed = JSON.parse(trimmed); } catch (_e) { parsed = null; }
-          if (parsed && parsed.text) {
-            const t = String(parsed.text).trim();
-            const c = typeof parsed.confidence === 'number' ? parsed.confidence : 0.85;
-            if (!t) continue;
-            tokens.push({ text: t, confidence: c, bbox: [[0, yPos], [Math.max(t.length * 12, 30), yPos], [Math.max(t.length * 12, 30), yPos + 24], [0, yPos + 24]] });
-          } else if (trimmed.length > 0 && trimmed.length < 50) {
-            tokens.push({ text: trimmed, confidence: 0.7, bbox: [[0, yPos], [trimmed.length * 12, yPos], [trimmed.length * 12, yPos + 24], [0, yPos + 24]] });
-          }
-          yPos += 30;
-        }
-        const rawText = tokens.map(function (t) { return t.text; }).join(' ');
-        return {
-          status: 200, body: {
-            success: true,
-            provider: 'minimax',
-            ocrEngine: 'MiniMax minimax-m3 (vision)',
-            rawOcrText: rawText,
-            extractedTokens: tokens,
-            processingTimeMs: Date.now() - t0,
-          }
-        };
-      }
-
-      // ===== OCR.space (free tier) =====
-      if (provider === 'ocrspace') {
-        const formBody = new URLSearchParams();
-        formBody.append('base64Image', 'data:image/jpeg;base64,' + base64Body);
-        formBody.append('apikey', apiKey);
-        formBody.append('language', 'eng');
-        formBody.append('isOverlayRequired', 'false');
-        formBody.append('scale', 'true');
-        formBody.append('OCREngine', '2');
-        formBody.append('detectOrientation', 'true');
-        const ocrRes = await fetch('https://api.ocr.space/parse/image', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: formBody.toString(),
-        });
-        const ocrJson = await ocrRes.json();
-        if (ocrJson.IsErroredOnProcessing) {
-          const errMsg = (ocrJson.ErrorMessage && ocrJson.ErrorMessage[0]) ||
-            ocrJson.ErrorDetails ||
-            ('OCR.space HTTP ' + ocrRes.status);
-          return { status: 502, body: { error: 'OCR.space: ' + errMsg } };
-        }
-        const parsed = (ocrJson.ParsedResults && ocrJson.ParsedResults[0]) || null;
-        const fullText = (parsed && parsed.ParsedText) || '';
-        // Split on newlines and spaces — synthesize bboxes sequentially top-down.
-        // Use String.prototype.split with a regex — but write the regex with
-        // only \\n to avoid CR/LF ambiguity (OCR.space text uses \\n).
-        const splitRegex = new RegExp(String.fromCharCode(10));
-        const lines = String(fullText).split(splitRegex);
-        const tokens = [];
-        let yPos = 0;
-        for (let li = 0; li < lines.length; li++) {
-          if (!lines[li] || !lines[li].trim()) continue;
-          const words = lines[li].trim().split(/\\s+/);
-          for (let wi = 0; wi < words.length; wi++) {
-            const w = words[wi];
-            if (!w) continue;
-            tokens.push({
-              text: w,
-              confidence: 0.85,
-              bbox: [[0, yPos], [Math.max(w.length * 12, 30), yPos], [Math.max(w.length * 12, 30), yPos + 24], [0, yPos + 24]],
-            });
-          }
-          yPos += 30;
-        }
-        return {
-          status: 200, body: {
-            success: true,
-            provider: 'ocrspace',
-            ocrEngine: 'OCR.space (Engine 2, free tier)',
-            rawOcrText: fullText,
-            extractedTokens: tokens,
-            processingTimeMs: Date.now() - t0,
-          }
-        };
-      }
-
-      // ===== AWS Textract (stub) =====
-      if (provider === 'aws') {
-        return {
-          status: 501, body: {
-            error: 'AWS Textract integration is not yet implemented. Pick Google Cloud Vision, MiniMax, OCR.space or use the local OCR button.',
-          }
-        };
-      }
-
       // ===== Ollama Cloud + Gemma 4 (vision) =====
       // Box-only OCR via Ollama Cloud chat completions, one call per page.
       // Prompt: read ONLY the handwritten value inside each digit-box; ignore
@@ -506,9 +304,19 @@ export function registerEvaluationRoutes(app: express.Express) {
           '9. EMPTY / UNANSWERED — No writing at all → null. Smudge or stray mark only → "unclear".',
           '',
           '════════════════════════════════════',
-          'WHAT NOT TO CAPTURE',
+          'PRINTED QUESTION TEXT — capture this too',
           '════════════════════════════════════',
-          '- Any printed text: instructions, question numbers, option labels, example digits, ',
+          'For each row, also capture the printed question text exactly as written on the sheet',
+          '(the question/instruction the student was answering) — this is used ONLY to double-check',
+          'that the row was matched to the right question downstream; it does not replace the',
+          'system\'s own record of the question. Keep it short: the question sentence or prompt itself,',
+          'not surrounding decorative text. If a printed question number precedes it (e.g. "3."), you',
+          'may include it. Do not paraphrase or translate — transcribe the printed text as-is.',
+          '',
+          '════════════════════════════════════',
+          'WHAT NOT TO CAPTURE (besides the question text above)',
+          '════════════════════════════════════',
+          '- Page-level instructions/headers not tied to a specific row, option labels, example digits, ',
           '  decorative borders, school name, page numbers, class/grade labels.',
           '- Printed images or diagrams (reference them only to determine left vs right ',
           '  for a circled answer).',
@@ -521,8 +329,7 @@ export function registerEvaluationRoutes(app: express.Express) {
           '- One key per row: "row_1", "row_2", … "row_N" — continuous across all pages.',
           '',
           'Each row value is either:',
-          '- A string (one answer or comma-separated answers for multi-slot rows)',
-          '- null (row exists but student left it blank)',
+          '- An object: {"question": "<printed question text>", "answer": "<student\'s answer, or null if blank>"}',
           '- An object with an "error" key (row belongs to an unreadable page)',
           '',
           'Example (2-page sheet, page 2 unreadable):',
@@ -534,21 +341,22 @@ export function registerEvaluationRoutes(app: express.Express) {
           '      "page_2": "Unreadable — could not extract answers. Please check scan quality."',
           '    }',
           '  },',
-          '  "row_1": "7, null, 9",',
-          '  "row_2": ">",',
-          '  "row_3": "left",',
-          '  "row_4": "A→3, B→1, C→2",',
-          '  "row_5": "circle, square, circle",',
-          '  "row_6": "heart",',
-          '  "row_7": "unclear",',
-          '  "row_8": null,',
+          '  "row_1": {"question": "Fill in the boxes: 3 + 4 = __, 5 - 2 = __, 8 + 1 = __", "answer": "7, null, 9"},',
+          '  "row_2": {"question": "Compare: 12 __ 9", "answer": ">"},',
+          '  "row_3": {"question": "Circle the larger number.", "answer": "left"},',
+          '  "row_4": {"question": "Match the following.", "answer": "A→3, B→1, C→2"},',
+          '  "row_5": {"question": "Circle the shapes shown.", "answer": "circle, square, circle"},',
+          '  "row_6": {"question": "Draw the shape described.", "answer": "heart"},',
+          '  "row_7": {"question": "What is 9 + 6?", "answer": "unclear"},',
+          '  "row_8": {"question": "What is 15 - 8?", "answer": null},',
           '  "row_9": { "error": "Page unreadable — could not extract answer. Please check scan quality." },',
           '  "row_10": { "error": "Page unreadable — could not extract answer. Please check scan quality." }',
           '}',
           '',
           'Rules:',
           '- Output ONLY the JSON object. No prose, no markdown fences, no commentary.',
-          '- Preserve exactly what the student wrote. Do not compute, correct, or normalise.',
+          '- Preserve exactly what the student wrote. Do not compute, correct, or normalise the answer.',
+          '- Transcribe the question text as printed — do not paraphrase, translate, or solve it.',
           '- For LEFT/RIGHT answers, base the decision purely on horizontal position on that page.',
           '- If you cannot confidently read a character, output "unclear" — do not guess.',
           '- Never invent rows that do not exist on the physical sheet.',
@@ -593,14 +401,18 @@ export function registerEvaluationRoutes(app: express.Express) {
         const rawText = (ollamaJson && ollamaJson.message && ollamaJson.message.content)
           ? String(ollamaJson.message.content)
           : '';
-        // Parse the model's row_N schema (new prompt) — keep the existing
-                // flat `answers[]` shape stable for downstream consumers (the
-                // IcrTwoStageScan → IcrScanner pipeline reads answers[] by index).
-                // We derive flatAnswers from sorted row_N keys so row 1, row 2,
-                // ... row N come out in order, and skip rows whose value is an
-                // { error: ... } object (the model emits those for unreadable
-                // pages).
+        // Parse the model's row_N schema. Keep the existing flat `answers[]`
+                // shape stable for downstream consumers (the IcrTwoStageScan ->
+                // IcrScanner pipeline reads answers[] by index), and additionally
+                // derive a parallel `extractedQuestions[]` array (same index
+                // alignment) — the printed question text the model read next to
+                // each answer. This is NOT used to replace the system's own
+                // known question for that row; it exists purely so a caller can
+                // flag a mismatch if the model's row segmentation drifted (e.g.
+                // it skipped or merged a row), catching a misaligned answer
+                // before it reaches scoring.
                 let flatAnswers: string[] | null = null;
+                let extractedQuestions: string[] | null = null;
                 let parseError: string | null = null;
                 let pageErrors: Record<string, string> | null = null;
                 let meta: any = null;
@@ -622,16 +434,36 @@ export function registerEvaluationRoutes(app: express.Express) {
                         .filter(k => /^row_\d+$/.test(k))
                         .sort((a, b) => parseInt(a.slice(4), 10) - parseInt(b.slice(4), 10));
                       if (rowKeys.length > 0) {
-                        flatAnswers = rowKeys.map(k => {
+                        flatAnswers = [];
+                        extractedQuestions = [];
+                        rowKeys.forEach(k => {
                           const v = parsed[k];
-                          if (v === null || v === undefined) return '';
+                          if (v === null || v === undefined) {
+                            flatAnswers!.push('');
+                            extractedQuestions!.push('');
+                            return;
+                          }
                           if (typeof v === 'object' && v && 'error' in v) {
                             // Per-page error — emit a sentinel token so the verify
                             // UI can show it. Use the literal "unclear" so the
                             // existing post-processing handles it consistently.
-                            return 'unclear';
+                            flatAnswers!.push('unclear');
+                            extractedQuestions!.push('');
+                            return;
                           }
-                          return String(v);
+                          // New schema: {"question": "...", "answer": "..."}.
+                          // Fall back to treating the whole value as the answer
+                          // (old schema / model didn't follow the new format)
+                          // so a prompt regression degrades gracefully instead
+                          // of losing the row entirely.
+                          if (typeof v === 'object' && v && 'answer' in v) {
+                            const ans = v.answer;
+                            flatAnswers!.push(ans === null || ans === undefined ? '' : String(ans));
+                            extractedQuestions!.push(typeof v.question === 'string' ? v.question : '');
+                          } else {
+                            flatAnswers!.push(String(v));
+                            extractedQuestions!.push('');
+                          }
                         });
                       } else {
                         parseError = 'model output did not contain any row_N keys';
@@ -660,6 +492,11 @@ export function registerEvaluationRoutes(app: express.Express) {
                     mimeUsed,
                     // The cleaned, flat answer list — exactly what the verify UI consumes.
                     answers: flatAnswers || [],
+                    // Parallel array (same index alignment as `answers`) of the
+                    // printed question text the model read next to each answer.
+                    // For validation/mismatch-flagging against the system's own
+                    // known question for that row — never used to replace it.
+                    extractedQuestions: extractedQuestions || [],
                     // Keep raw text + tokens for the OCR analysis preview pane.
                     extractedText: rawText,
                     extractedTokens: tokens,
@@ -674,10 +511,6 @@ export function registerEvaluationRoutes(app: express.Express) {
                     // try to parse it client-side as a fallback.
                     structured: flatAnswers != null,
                     structuredError: parseError,
-                    // Issue #234: surface a row-count mismatch explicitly instead of
-                    // letting the frontend silently pad/truncate. expectedCount is
-                    // only present when the caller (frontend) already knew the real
-                    // question count for this student's paper.
                     expectedCount: expectedCount ?? null,
                     countMismatch: (typeof expectedCount === 'number' && expectedCount > 0 && flatAnswers != null)
                       ? flatAnswers.length !== expectedCount
@@ -687,21 +520,34 @@ export function registerEvaluationRoutes(app: express.Express) {
                 };
       }
 
-
-      // ===== Azure Computer Vision (stub) =====
-      if (provider === 'azure') {
-        return {
-          status: 501, body: {
-            error: 'Azure Computer Vision integration is not yet implemented. Pick Google Cloud Vision, MiniMax, OCR.space or use the local OCR button.',
-          }
-        };
-      }
-
       return { status: 400, body: { error: 'Unknown provider: ' + provider } };
     } catch (e: any) {
       return { status: 500, body: { error: 'Cloud OCR failed: ' + (e && e.message ? e.message : String(e)) } };
     }
   };
+
+  // Scan quality endpoint: analyzes scan metrics (resolution, orientation)
+  // before starting OCR extraction. Returns ScanQualityResult.
+  app.post('/api/icr/check-quality', async (req, res) => {
+    const user = getAuthUser(req);
+    if (!user) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { imageDataUrl, fileBase64, mimeType } = req.body || {};
+    const singleDataUrl = imageDataUrl || fileBase64;
+    if (!singleDataUrl || typeof singleDataUrl !== 'string') {
+      return res.status(400).json({ error: 'imageDataUrl or fileBase64 is required.' });
+    }
+
+    try {
+      const commaIdx = singleDataUrl.indexOf(',');
+      const base64Body = commaIdx >= 0 ? singleDataUrl.slice(commaIdx + 1) : singleDataUrl;
+      const buffer = Buffer.from(base64Body, 'base64');
+      const quality = analyzeScanQuality(buffer, mimeType);
+      return res.json({ success: true, qualityResult: quality });
+    } catch (err: any) {
+      return res.status(400).json({ error: 'Failed to analyze scan quality: ' + (err?.message || err) });
+    }
+  });
 
   // OCR endpoint: takes {provider, imageDataUrl} or {provider, fileBase64}
   // for a single image or PDF. NO apiKey from frontend. The frontend
@@ -712,7 +558,7 @@ export function registerEvaluationRoutes(app: express.Express) {
     const user = getAuthUser(req);
     if (!user) return res.status(401).json({ error: 'Unauthorized' });
 
-    const { imageDataUrl, fileBase64, provider, expectedCount } = req.body || {};
+    const { imageDataUrl, fileBase64, provider, expectedCount, proceedDespiteQualityWarning } = req.body || {};
     const singleDataUrl = imageDataUrl || fileBase64;
     if (!singleDataUrl || typeof singleDataUrl !== 'string') {
       return res.status(400).json({ error: 'imageDataUrl or fileBase64 is required (data URL).' });
@@ -720,6 +566,29 @@ export function registerEvaluationRoutes(app: express.Express) {
     if (provider !== 'ollama-gemma4') {
       return res.status(400).json({ error: 'provider must be "ollama-gemma4".' });
     }
+
+    // Pre-OCR scan quality validation gate
+    const commaIdx = singleDataUrl.indexOf(',');
+    const base64Body = commaIdx >= 0 ? singleDataUrl.slice(commaIdx + 1) : singleDataUrl;
+    const imgBuf = Buffer.from(base64Body, 'base64');
+    const qualityResult = analyzeScanQuality(imgBuf);
+
+    if (qualityResult.status === 'reject') {
+      return res.status(400).json({
+        error: 'Scan quality check failed: ' + qualityResult.reasons.join('; '),
+        qualityResult,
+        canOverride: false,
+      });
+    }
+
+    if (qualityResult.status === 'warning' && proceedDespiteQualityWarning !== true) {
+      return res.status(422).json({
+        error: 'Scan quality warning: ' + qualityResult.reasons.join('; '),
+        qualityResult,
+        canOverride: true,
+      });
+    }
+
     // Optional (issue #234): the caller may already know the real question
     // count for this student's paper (from the diagnostic answer key). When
     // present, it's used to tell the model exactly how many rows to expect
@@ -737,6 +606,9 @@ export function registerEvaluationRoutes(app: express.Express) {
     }
 
     const r = await runCloudOcrOnImage(singleDataUrl, provider, apiKey, expectedCountNum);
+    if (r.body && typeof r.body === 'object') {
+      r.body.scanQuality = qualityResult;
+    }
     return res.status(r.status).json(r.body);
   });
 
@@ -892,7 +764,7 @@ export function registerEvaluationRoutes(app: express.Express) {
     const user = getAuthUser(req);
     if (!user) return res.status(401).json({ error: 'Unauthorized' });
 
-    const { fileDataUrl, imageDataUrl, fileBase64, provider, pagesPerStudent } = req.body || {};
+    const { fileDataUrl, imageDataUrl, fileBase64, provider, pagesPerStudent, expectedCount } = req.body || {};
     const singleDataUrl = fileDataUrl || imageDataUrl || fileBase64;
     if (!singleDataUrl || typeof singleDataUrl !== 'string') {
       return res.status(400).json({ error: 'fileDataUrl / imageDataUrl / fileBase64 is required (data URL).' });
@@ -908,6 +780,19 @@ export function registerEvaluationRoutes(app: express.Express) {
     const pps = Number.isFinite(pagesPerStudent) && pagesPerStudent >= 1
       ? Math.min(Math.floor(pagesPerStudent), 20) // hard cap to avoid accidental 1000
       : 2;
+
+    // Optional: how many questions ONE student's paper has, applied uniformly
+    // to every chunk in this batch. A bulk scan is normally one class/level,
+    // so every student in it has the same-length paper — same assumption the
+    // single-scan flow's expectedCount already makes for one student. Without
+    // this, the model has no row-count guardrail on the bulk path and can
+    // over-segment (e.g. split a multi-part question into multiple rows),
+    // producing more rows than the student's real answer key has (#549-adjacent
+    // bug: the bulk endpoint never wired up the same guard the single-scan
+    // path has had since #234/PR #314).
+    const expectedCountPerStudent = (typeof expectedCount === 'number' && expectedCount > 0)
+      ? Math.floor(expectedCount)
+      : undefined;
 
     const apiKey = await getCloudKey(provider);
     if (!apiKey) {
@@ -990,7 +875,7 @@ export function registerEvaluationRoutes(app: express.Express) {
         // Reuse the existing single-image helper — it already handles
         // data:application/pdf → rasterize → Ollama → parse JSON for the
         // Ollama branch. No logic duplication.
-        r = await runCloudOcrOnImage(chunkDataUrl, provider, apiKey);
+        r = await runCloudOcrOnImage(chunkDataUrl, provider, apiKey, expectedCountPerStudent);
       } catch (e: any) {
         results.push({
           studentIndex: i,
@@ -1137,25 +1022,24 @@ export function registerEvaluationRoutes(app: express.Express) {
 
     // Grade and generate AI narrative using Gemini AI
     const studentQuestions = ws.questions.filter(q => q.question_id.startsWith(student.id + '_'));
-    const evaluation = await evaluateAIWorksheet(student.name, student.currentLevel, studentQuestions, answers);
+    const evaluation = await evaluateAIWorksheet(
+      student.name,
+      studentQuestions,
+      answers,
+      student.currentLevel
+    );
 
-    // Determine subLevel based on question performance at the recommended level
-    let newSubLevel = 0; // default Mastery
-    const recLevel = evaluation.recommendedLevel;
-    const levelQs = studentQuestions.filter(q => q.source_level === recLevel);
-    if (levelQs.length > 0) {
-      let failedCount = 0;
-      levelQs.forEach(q => {
-        const submitted = (answers[q.question_id] || '').trim().toLowerCase();
-        const correct = q.answer.trim().toLowerCase();
-        if (submitted !== correct) failedCount++;
-      });
-      if (failedCount === levelQs.length) {
-        newSubLevel = 2; // Remedial
-      } else if (failedCount > 0) {
-        newSubLevel = 1; // Easier
-      }
-    }
+    const advancement = calculateStandardAdvancement(
+      student.currentLevel,
+      evaluation.total,
+      evaluation.score
+    );
+
+    const recommendedLevel = advancement.newLevel;
+    const newSubLevel = advancement.newSubLevel;
+
+
+
 
     // Save submission
     const submission: AnswerSubmission = {
@@ -1178,11 +1062,12 @@ export function registerEvaluationRoutes(app: express.Express) {
       id: 'rep_' + student.id + '_' + Date.now(),
       studentId,
       worksheetId,
+      cycle: ws.cycle,
       score: evaluation.score,
       totalQuestions: studentQuestions.length,
       conceptMastery: evaluation.conceptMastery,
       narrative: evaluation.narrative,
-      recommendedLevel: evaluation.recommendedLevel,
+      recommendedLevel: recommendedLevel,
       recommendedSubLevel: newSubLevel,
       timestamp: now.toISOString(),
       // Issue #180: per-question breakdown so a teacher can later correct
@@ -1192,12 +1077,27 @@ export function registerEvaluationRoutes(app: express.Express) {
         question: q.question,
         correctAnswer: q.answer,
         submittedAnswer: answers[q.question_id] || '',
-        isCorrect: (answers[q.question_id] || '').trim().toLowerCase() === q.answer.trim().toLowerCase(),
+        isCorrect: (answers[q.question_id] || '').trim().toLowerCase() === q.answer.trim().toLowerCase()
+          || matchesChoiceLetter(answers[q.question_id], q),
       })),
+      // #402: this path never set rootCauses before, unlike the diagnostic
+      // path — the same gap the override handler had, just one step
+      // earlier. computeRootCauseAnalysis is the exact logic the diagnostic
+      // path already uses; ({}) for evalData because nothing wires a real
+      // pipeline verdict in yet (#458), same as that path's own call.
+      // Deliberately only taking rootCauses here, not the function's other
+      // fields (levelsFailed/prerequisitesToCheck/performanceByDifficulty)
+      // — out of scope for #402, which only asks about rootCauses.
+      rootCauses: computeRootCauseAnalysis({}, studentQuestions, answers).rootCauses,
     };
 
     await dbStore.addEvaluationReport(report);
 
+    // Fire-and-forget: re-evaluate certification eligibility.
+    // Issue #845: only End-of-year worksheets may create or flag a certificate.
+    if (ws.cycle === 'End-of-year') {
+      runCertificationEligibility(student);
+    }
     try {
       await assignStudentToArchetype(studentId);
     } catch (error) {
@@ -1206,9 +1106,9 @@ export function registerEvaluationRoutes(app: express.Express) {
 
     // If correct, update student levels
     const levelHistory = [...student.levelHistory];
-    if (evaluation.recommendedLevel !== student.currentLevel || newSubLevel !== (student.currentSubLevel || 0)) {
+    if (recommendedLevel !== student.currentLevel || newSubLevel !== (student.currentSubLevel || 0)) {
       levelHistory.push({
-        level: evaluation.recommendedLevel,
+        level: recommendedLevel,
         subLevel: newSubLevel,
         date: now.toISOString().split('T')[0],
         reason: ws.cycle // already one of CYCLE_NAMES
@@ -1216,9 +1116,10 @@ export function registerEvaluationRoutes(app: express.Express) {
     }
 
     await dbStore.updateStudent(student.id, {
-      currentLevel: evaluation.recommendedLevel,
+      currentLevel: recommendedLevel,
       currentSubLevel: newSubLevel,
-      targetLevel: Math.min(93, evaluation.recommendedLevel + 1),
+      // Capped at 59, not 93: worksheet generation still throws UnknownLevelError above 59.
+      targetLevel: Math.min(59, recommendedLevel + 1),
       levelHistory
     });
 
@@ -1284,16 +1185,16 @@ export function registerEvaluationRoutes(app: express.Express) {
       i => i.studentId === studentId && i.status === 'active' && !i.outcome
     );
     for (const intv of activeInterventions) {
-      const improved = evaluation.recommendedLevel > intv.currentLevel;
+      const improved = recommendedLevel > intv.currentLevel;
       await dbStore.updateIntervention(intv.id, {
         status: 'completed',
         endDate: now.toISOString().split('T')[0],
         outcome: {
           improved,
           previousLevel: intv.currentLevel,
-          newLevel: evaluation.recommendedLevel,
+          newLevel: recommendedLevel,
           improvementDetails: improved
-            ? `Auto-detected: Student improved from Level ${intv.currentLevel} to Level ${evaluation.recommendedLevel} after intervention targeting ${intv.weakCompetencies.join(', ')}.`
+            ? `Auto-detected: Student improved from Level ${intv.currentLevel} to Level ${recommendedLevel} after intervention targeting ${intv.weakCompetencies.join(', ')}.`
             : `Auto-detected: Student remained at Level ${intv.currentLevel} after intervention. Further remediation may be needed.`,
           assessmentId: report.id,
           detectedAt: now.toISOString()
@@ -1367,7 +1268,7 @@ export function registerEvaluationRoutes(app: express.Express) {
 
     const student = await dbStore.getStudentById(req.params.studentId);
     if (!student) return res.status(404).json({ error: 'Student not found.' });
-    if (!canAccessStudent(user, student)) return res.status(403).json({ error: 'Forbidden.' });
+    if (!(await canAccessStudent(user, student))) return res.status(403).json({ error: 'Forbidden.' });
 
     const reps = await dbStore.getEvaluationReports({ studentIds: [req.params.studentId] });
     // Sort newest first so the UI's "most recent placement" view shows
@@ -1386,7 +1287,7 @@ export function registerEvaluationRoutes(app: express.Express) {
 
     const student = await dbStore.getStudentById(req.params.studentId);
     if (!student) return res.status(404).json({ error: 'Student not found.' });
-    if (!canAccessStudent(user, student)) return res.status(403).json({ error: 'Forbidden.' });
+    if (!(await canAccessStudent(user, student))) return res.status(403).json({ error: 'Forbidden.' });
 
     const reps = await dbStore.getEvaluationReports({ studentIds: [req.params.studentId] });
     const diagnosticReports = reps.filter(r => r.worksheetId === 'diagnostic');
@@ -1411,7 +1312,7 @@ export function registerEvaluationRoutes(app: express.Express) {
 
     const student = await dbStore.getStudentById(report.studentId);
     if (!student) return res.status(404).json({ error: 'Student not found.' });
-    if (!canAccessStudent(user, student)) return res.status(403).json({ error: 'Forbidden.' });
+    if (!(await canAccessStudent(user, student))) return res.status(403).json({ error: 'Forbidden.' });
 
     if (!report.questionResults || report.questionResults.length === 0) {
       return res.status(400).json({
@@ -1419,11 +1320,37 @@ export function registerEvaluationRoutes(app: express.Express) {
       });
     }
 
+    // Allowed errorType values: deterministic classifier ErrorType values plus
+    // pedagogical labels from teacher human diagnosis (#459).
+    const ALLOWED_ERROR_TYPES = new Set([
+      'unanswered',
+      'digit_reversal',
+      'decimal_place_shift',
+      'off_by_one',
+      'unclassified',
+      'conceptual',
+      'careless',
+      'prerequisite',
+    ]);
+
     const { corrections } = req.body as {
-      corrections: { questionId: string; isCorrect: boolean; correctedAnswer?: string }[];
+      corrections: {
+        questionId: string;
+        isCorrect: boolean;
+        correctedAnswer?: string;
+        errorType?: string;
+      }[];
     };
     if (!Array.isArray(corrections) || corrections.length === 0) {
       return res.status(400).json({ error: '`corrections` must be a non-empty array.' });
+    }
+
+    for (const c of corrections) {
+      if (c.errorType !== undefined && !ALLOWED_ERROR_TYPES.has(c.errorType)) {
+        return res.status(400).json({
+          error: `Invalid errorType "${c.errorType}". Must be one of: ${Array.from(ALLOWED_ERROR_TYPES).join(', ')}`,
+        });
+      }
     }
 
     const knownIds = new Set(report.questionResults.map(q => q.questionId));
@@ -1440,12 +1367,48 @@ export function registerEvaluationRoutes(app: express.Express) {
         ...q,
         submittedAnswer: correction.correctedAnswer ?? q.submittedAnswer,
         isCorrect: correction.isCorrect,
+        // Keep the teacher's label so a later override does not lose it.
+        // A question that is now correct has no error to label.
+        teacherErrorType: correction.isCorrect ? undefined : (correction.errorType ?? q.teacherErrorType),
       };
     });
 
     const newScore = updatedQuestionResults.filter(q => q.isCorrect).length;
     const totalQuestions = updatedQuestionResults.length;
     const percentage = Math.round((newScore / totalQuestions) * 100);
+
+    // #402: recompute rootCauses from the corrected answers, same logic as
+    // the original submission path (computeRootCauseAnalysis). Needs the
+    // real Question objects (topic/source_level aren't on questionResults),
+    // so the worksheet has to be fetched here rather than working from
+    // questionResults alone. Best-effort: a report making it this far always
+    // has questionResults (checked above), so this only fails if the
+    // worksheet itself is gone — in which case rootCauses is left as
+    // whatever it already was rather than failing the whole override, same
+    // as assignStudentToArchetype's try/catch just below.
+    let updatedRootCauses: EvaluationReport['rootCauses'] | undefined;
+    try {
+      const worksheets = await dbStore.getWorksheets();
+      const ws = worksheets.find(w => w.id === report.worksheetId);
+      if (ws) {
+        const stillWrongIds = new Set(updatedQuestionResults.filter(q => !q.isCorrect).map(q => q.questionId));
+        const matchedQuestions = ws.questions.filter(q => stillWrongIds.has(q.question_id));
+        const answersForAnalysis: { [questionId: string]: string } = {};
+        for (const q of updatedQuestionResults) answersForAnalysis[q.questionId] = q.submittedAnswer;
+        updatedRootCauses = computeRootCauseAnalysis({}, matchedQuestions, answersForAnalysis).rootCauses ?? [];
+
+        // #459: teacher-supplied errorType wins over deterministic classifier
+        // for still-wrong questions that have a teacher diagnostic label.
+        if (updatedRootCauses.length > 0) {
+          updatedRootCauses = updatedRootCauses.map(rc => {
+            const label = correctionMap.get(rc.questionId)?.errorType ?? updatedQuestionResults.find(q => q.questionId === rc.questionId)?.teacherErrorType;
+            return label ? { ...rc, errorType: label as any } : rc;
+          });
+        }
+      }
+    } catch (error) {
+      console.error('[override] Failed to recompute rootCauses after correction:', error);
+    }
 
     // Re-derive recommendedLevel/subLevel using the same score%-based mapping
     // already established elsewhere in this file for ICR-scanned diagnostics
@@ -1454,7 +1417,8 @@ export function registerEvaluationRoutes(app: express.Express) {
     // turning a score into a level.
     const classMatch = student.classGroup.match(/\d+/);
     const classNumber = classMatch ? parseInt(classMatch[0], 10) : 1;
-    const recommendedLevel = Math.max(1, Math.min(93, (classNumber - 1) * 10 + Math.ceil(percentage / 10)));
+    // Capped at 59, not 93: worksheet generation still throws UnknownLevelError above 59.
+    const recommendedLevel = Math.max(1, Math.min(59, (classNumber - 1) * 10 + Math.ceil(percentage / 10)));
     const recommendedSubLevel = percentage >= 80 ? 0 : percentage >= 50 ? 1 : 2;
 
     const updatedReport = await dbStore.updateEvaluationReport(report.id, {
@@ -1465,7 +1429,25 @@ export function registerEvaluationRoutes(app: express.Express) {
       teacherReviewed: true,
       reviewedBy: user.email,
       reviewedAt: new Date().toISOString(),
+      // #402: only overwrite if recomputation actually succeeded, so a
+      // worksheet-lookup failure can't wipe out a previously-good value.
+      ...(updatedRootCauses !== undefined ? { rootCauses: updatedRootCauses } : {}),
     });
+
+    // #402: an override changes what the misconception fingerprint and
+    // archetype were computed from, so both need to catch up — same call
+    // sequence already used on the original (non-override) submission path
+    // just above in this file, at the addAnswerSubmission/addEvaluationReport
+    // calls. invalidateFingerprintCache() is a cheap global cache clear, not
+    // a cohort re-cluster; assignStudentToArchetype() only recomputes this
+    // one student. Reusing that existing pattern here rather than inventing
+    // a different one for the override path.
+    invalidateFingerprintCache();
+    try {
+      await assignStudentToArchetype(student.id);
+    } catch (error) {
+      console.error('[archetype] Failed to reassign student to misconception archetype after override:', error);
+    }
 
     // Only touch the student's placement if the correction actually changed
     // the outcome. Assumes the most recent levelHistory entry is the one
@@ -1481,7 +1463,7 @@ export function registerEvaluationRoutes(app: express.Express) {
       await dbStore.updateStudent(student.id, {
         currentLevel: recommendedLevel,
         currentSubLevel: recommendedSubLevel,
-        targetLevel: Math.min(93, recommendedLevel + 1),
+        targetLevel: Math.min(59, recommendedLevel + 1),
         levelHistory,
       });
     }

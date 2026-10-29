@@ -4,10 +4,12 @@ import { apiFetch } from '../services/apiClient';
 import {
   Menu, X, Search, Bell, Sun, Moon, LogOut, ChevronRight, ChevronLeft, ChevronDown,
   LayoutDashboard, BookOpen, UserCheck, Calendar, ShieldCheck, HelpCircle, Settings, Users,
-  School, GraduationCap, MapPin, BarChart3, ClipboardList, ShieldAlert, KeyRound, Clock, Database, Home,
-  Fingerprint
+  School, GraduationCap, MapPin, BarChart3, ClipboardList, ShieldAlert, KeyRound, Clock, Database, Home, Award,
+  Fingerprint, Ticket as TicketIcon, ScrollText
 } from 'lucide-react';
 import { LanguageSwitcher } from './LanguageSwitcher';
+import { TicketModal } from './tickets/TicketModal';
+import { LogbookModal } from './LogbookModal';
 
 interface NavigationItem {
   name: string;
@@ -19,6 +21,7 @@ interface NavigationItem {
 
 interface LayoutProps {
   currentUser: User;
+  token: string;
   onRoleSwitch: (role: UserRole) => void;
   activeView: string;
   onSelectView: (view: string) => void;
@@ -34,6 +37,7 @@ interface LayoutProps {
 
 export const Layout: React.FC<LayoutProps> = ({
   currentUser,
+  token,
   onRoleSwitch,
   activeView,
   onSelectView,
@@ -57,6 +61,8 @@ export const Layout: React.FC<LayoutProps> = ({
   const [mobileOpen, setMobileOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [showNotifications, setShowNotifications] = useState(false);
+  const [showTicketModal, setShowTicketModal] = useState(false);
+  const [showLogbookModal, setShowLogbookModal] = useState(false);
 
 
   const [expandedMenus, setExpandedMenus] = useState<Record<string, boolean>>({});
@@ -71,9 +77,6 @@ export const Layout: React.FC<LayoutProps> = ({
   const [pinnedItems, setPinnedItems] = useState<string[]>(['Dashboard']);
   const [dbStatus, setDbStatus] = useState<{ connected: boolean; mode: string } | null>(null);
   const [showDbModal, setShowDbModal] = useState(false);
-  const [customUri, setCustomUri] = useState('');
-  const [dbConnecting, setDbConnecting] = useState(false);
-  const [dbConnectMsg, setDbConnectMsg] = useState<{ success: boolean; text: string } | null>(null);
 
   useEffect(() => {
     apiFetch('/api/db-status')
@@ -102,6 +105,14 @@ export const Layout: React.FC<LayoutProps> = ({
   }, []);
 
   const collapsed = false;
+
+  // Mirrors GET /api/logbook authorization: only admin-tier roles may read the
+  // audit trail (teacher/volunteer/school receive 403), so hide the action for them.
+  const canViewLogbook =
+    currentUser.role === UserRole.SUPERADMIN ||
+    currentUser.role === UserRole.ADMIN ||
+    currentUser.role === UserRole.DISTRICT_ADMIN ||
+    currentUser.role === UserRole.BLOCK_ADMIN;
 
   const toggleSidebar = () => {
     setSidebarCollapsed((prev: boolean) => {
@@ -149,6 +160,12 @@ export const Layout: React.FC<LayoutProps> = ({
         });
         list.push({ name: 'Worksheets', view: 'worksheets', icon: ClipboardList });
         list.push({ name: 'Misconceptions', view: 'misconceptions', icon: Fingerprint });
+        // Pedagogical & Process Feedback — moved out of the TeacherDashboard
+        // body into the LHS sidebar so the ticket form doesn't crowd the
+        // student list / diagnostic cards. The `activePanel === 'tickets'`
+        // route in App.tsx renders the same <TicketSubmission> component
+        // that used to live inline here.
+        list.push({ name: 'Feedback', view: 'tickets', icon: HelpCircle });
         break;
 
       case UserRole.VOLUNTEER:
@@ -187,17 +204,27 @@ export const Layout: React.FC<LayoutProps> = ({
         list.push({ name: 'Teachers', view: 'teachers', icon: Users });
         list.push({ name: 'Performance', view: 'performance', icon: BarChart3 });
         list.push({ name: 'Analytics', view: 'analytics', icon: BarChart3 });
+        list.push({ name: 'Question Bank', view: 'question_bank', icon: Database });
+        list.push({ name: 'Aadhaar Reveal', view: 'aadhaar_reveal', icon: ShieldCheck });
+        list.push({ name: 'Security', view: 'security', icon: KeyRound });
         break;
 
       case UserRole.DISTRICT_ADMIN:
         list.push({ name: 'Blocks', view: 'blocks', icon: MapPin });
         list.push({ name: 'Schools', view: 'schools', icon: School });
         list.push({ name: 'Analytics', view: 'analytics', icon: BarChart3 });
+        list.push({ name: 'Question Bank', view: 'question_bank', icon: Database });
+        list.push({ name: 'Aadhaar Reveal', view: 'aadhaar_reveal', icon: ShieldCheck });
+        list.push({ name: 'Security', view: 'security', icon: KeyRound });
         break;
 
       case UserRole.ADMIN:
         list.push({ name: 'Districts', view: 'districts', icon: MapPin });
         list.push({ name: 'Analytics', view: 'analytics', icon: BarChart3 });
+        list.push({ name: 'Question Bank', view: 'question_bank', icon: Database });
+        list.push({ name: 'Aadhaar Reveal', view: 'aadhaar_reveal', icon: ShieldCheck });
+        list.push({ name: 'Security', view: 'security', icon: KeyRound });
+        list.push({ name: 'Certification Reviews', view: 'certification_reviews', icon: Award });
         break;
 
       case UserRole.SUPERADMIN:
@@ -205,9 +232,13 @@ export const Layout: React.FC<LayoutProps> = ({
         list.push({ name: 'Schools', view: 'schools', icon: School });
         list.push({ name: 'Worksheet Templates', view: 'worksheet_templates', icon: ClipboardList });
         list.push({ name: 'Content', view: 'content', icon: BookOpen });
+        list.push({ name: 'Question Bank', view: 'question_bank', icon: Database });
         list.push({ name: 'Analytics', view: 'analytics', icon: BarChart3 });
         list.push({ name: 'System Settings', view: 'system_settings', icon: Settings });
+        list.push({ name: 'Aadhaar Reveal', view: 'aadhaar_reveal', icon: ShieldCheck });
+        list.push({ name: 'Security', view: 'security', icon: KeyRound });
         list.push({ name: 'Audit Logs', view: 'logbook', icon: ShieldCheck });
+        list.push({ name: 'Certification Reviews', view: 'certification_reviews', icon: Award });
         break;
     }
 
@@ -255,7 +286,7 @@ export const Layout: React.FC<LayoutProps> = ({
     <div className="flex min-h-screen flex-col font-sans bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100 antialiased">
 
       {/* Accessibility / Top strip */}
-      <div className="w-full bg-[#111827] text-gray-300 text-[10px] md:text-xs font-semibold px-6 py-2 flex justify-between items-center border-b border-gray-800 shrink-0">
+      <div className="w-full bg-[#111827] text-gray-300 text-[10px] md:text-xs font-semibold px-3 md:px-6 py-2 flex justify-between items-center border-b border-gray-800 shrink-0">
         <div className="flex items-center gap-3">
           <span className="font-bold text-white dark:text-gray-200">FLN Portal</span>
           <span className="text-gray-500 dark:text-gray-600">|</span>
@@ -263,9 +294,9 @@ export const Layout: React.FC<LayoutProps> = ({
         </div>
         <div className="flex items-center gap-4">
           <div className="flex items-center gap-1 text-[10px] md:text-xs font-bold">
-            <button onClick={() => adjustFontSize(-10)} className="hover:text-white transition px-1.5 py-0.5 rounded border border-gray-700 hover:border-gray-500" title="Decrease font size">A-</button>
-            <button onClick={resetFontSize} className="hover:text-white transition px-1.5 py-0.5 rounded border border-gray-700 hover:border-gray-500" title="Reset font size">A</button>
-            <button onClick={() => adjustFontSize(10)} className="hover:text-white transition px-1.5 py-0.5 rounded border border-gray-700 hover:border-gray-500" title="Increase font size">A+</button>
+            <button onClick={() => adjustFontSize(-10)} className="hover:text-white transition px-1.5 py-0.5 min-h-[44px] min-w-[44px] md:min-h-0 md:min-w-0 rounded border border-gray-700 hover:border-gray-500" title="Decrease font size">A-</button>
+            <button onClick={resetFontSize} className="hover:text-white transition px-1.5 py-0.5 min-h-[44px] min-w-[44px] md:min-h-0 md:min-w-0 rounded border border-gray-700 hover:border-gray-500" title="Reset font size">A</button>
+            <button onClick={() => adjustFontSize(10)} className="hover:text-white transition px-1.5 py-0.5 min-h-[44px] min-w-[44px] md:min-h-0 md:min-w-0 rounded border border-gray-700 hover:border-gray-500" title="Increase font size">A+</button>
           </div>
           <span className="text-gray-700 dark:text-gray-500">|</span>
           <LanguageSwitcher variant="dark" />
@@ -273,11 +304,11 @@ export const Layout: React.FC<LayoutProps> = ({
       </div>
 
       {/* Unified Topbar */}
-      <header className="sticky top-0 z-30 flex h-20 w-full items-center justify-between border-b border-slate-200 bg-white px-6 transition duration-200 shrink-0 dark:border-slate-700 dark:bg-slate-900">
+      <header className="sticky top-0 z-30 flex h-auto min-h-20 w-full flex-wrap items-center justify-between gap-y-2 border-b border-slate-200 bg-white px-3 py-2 transition duration-200 shrink-0 md:h-20 md:flex-nowrap md:gap-y-0 md:px-6 md:py-0 dark:border-slate-700 dark:bg-slate-900">
         <div className="flex items-center gap-3">
           <button
             onClick={() => setMobileOpen(!mobileOpen)}
-            className="rounded-lg p-2 text-slate-650 hover:bg-slate-100 md:hidden dark:text-slate-400 dark:hover:bg-slate-800"
+            className="rounded-lg p-2 min-h-[44px] min-w-[44px] md:min-h-0 md:min-w-0 text-slate-650 hover:bg-slate-100 md:hidden dark:text-slate-400 dark:hover:bg-slate-800"
             aria-label="Toggle sidebar menu"
           >
             <Menu className="h-5 w-5" />
@@ -319,20 +350,20 @@ export const Layout: React.FC<LayoutProps> = ({
         </div>
 
         {/* Topbar Right Section */}
-        <div className="flex items-center gap-4">
+        <div className="flex flex-wrap items-center justify-end gap-2 md:flex-nowrap md:gap-4">
           {/* Language Switcher — dashboard chrome labels remain English for now;
               the landing page hero/stats/vision copy is already routed through t(). */}
-          <LanguageSwitcher />
+          <div className="hidden md:block"><LanguageSwitcher /></div>
 
           {/* Dynamic Database Storage Status */}
           <button
             onClick={() => setShowDbModal(true)}
-            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg border text-xs font-mono font-bold shrink-0 cursor-pointer transition ${
+            className={`hidden md:flex items-center gap-2 px-3 py-1.5 rounded-lg border text-xs font-mono font-bold shrink-0 cursor-pointer transition ${
               dbStatus?.connected
                 ? 'border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100 dark:bg-emerald-950/40 dark:border-emerald-800 dark:text-emerald-300'
                 : 'border-amber-300 bg-amber-50 text-amber-800 hover:bg-amber-100 dark:bg-amber-950/40 dark:border-amber-800 dark:text-amber-300'
             }`}
-            title="Click to view Database status and options"
+            title="Database connection status"
           >
             <span className={`h-2.5 w-2.5 rounded-full shrink-0 ${dbStatus?.connected ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'}`} />
             <span className="text-[10px] uppercase tracking-wider">
@@ -343,7 +374,7 @@ export const Layout: React.FC<LayoutProps> = ({
           {/* Theme Toggle */}
           <button
             onClick={onThemeToggle}
-            className="rounded-lg p-2 text-slate-505 hover:bg-slate-100 hover:text-slate-800 transition-all duration-200 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-100"
+            className="rounded-lg p-2 min-h-[44px] min-w-[44px] md:min-h-0 md:min-w-0 text-slate-505 hover:bg-slate-100 hover:text-slate-800 transition-all duration-200 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-100"
             title={isDark ? "Switch to Light Mode" : "Switch to Dark Mode"}
           >
             {isDark ? <Sun className="h-4.5 w-4.5 text-amber-500" /> : <Moon className="h-4.5 w-4.5" />}
@@ -351,9 +382,9 @@ export const Layout: React.FC<LayoutProps> = ({
 
           {/* Notifications bell */}
           <div className="relative">
-            <button
+            <button aria-label="Notifications"
               onClick={() => setShowNotifications(!showNotifications)}
-              className="relative rounded-lg p-2 text-slate-505 hover:bg-slate-100 transition dark:text-slate-400 dark:hover:bg-slate-800"
+              className="relative rounded-lg p-2 min-h-[44px] min-w-[44px] md:min-h-0 md:min-w-0 text-slate-505 hover:bg-slate-100 transition dark:text-slate-400 dark:hover:bg-slate-800"
             >
               <Bell className="h-4.5 w-4.5" />
               {notifications.length > 0 && (
@@ -396,6 +427,28 @@ export const Layout: React.FC<LayoutProps> = ({
             )}
           </div>
 
+          {/* Support Tickets — opens the existing ticket list/create flow */}
+          <button
+            onClick={() => setShowTicketModal(true)}
+            className="rounded-lg p-2 min-h-[44px] min-w-[44px] md:min-h-0 md:min-w-0 text-slate-505 hover:bg-slate-100 hover:text-indigo-600 transition dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-indigo-400"
+            title="Support Tickets"
+            aria-label="Open support tickets"
+          >
+            <TicketIcon className="h-4.5 w-4.5" />
+          </button>
+
+          {/* Activity Logbook — admin-tier only, matching /api/logbook authorization */}
+          {canViewLogbook && (
+            <button
+              onClick={() => setShowLogbookModal(true)}
+              className="rounded-lg p-2 min-h-[44px] min-w-[44px] md:min-h-0 md:min-w-0 text-slate-505 hover:bg-slate-100 hover:text-indigo-600 transition dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-indigo-400"
+              title="Activity Logbook"
+              aria-label="Open activity logbook"
+            >
+              <ScrollText className="h-4.5 w-4.5" />
+            </button>
+          )}
+
           {/* User Profile Info */}
           <div className="flex items-center gap-2 border-l border-slate-200 pl-4 dark:border-slate-700">
             <div className="flex h-8 w-8 items-center justify-center rounded-full bg-indigo-100 text-sm font-semibold text-indigo-700 dark:bg-indigo-900/50 dark:text-indigo-300">
@@ -403,20 +456,20 @@ export const Layout: React.FC<LayoutProps> = ({
             </div>
             <div className="hidden flex-col sm:flex">
               <span className="text-xs font-bold text-slate-900 dark:text-white">{currentUser.name}</span>
-              <span className="text-[9px] font-mono text-slate-400 uppercase tracking-wide dark:text-slate-500">
+              <span className="text-[11px] font-mono text-slate-600 uppercase tracking-wide dark:text-slate-400">
                 {currentUser.role.replace('_', ' ')}
               </span>
             </div>
             <button
               onClick={onNavigateHome}
-              className="rounded-lg p-2 text-slate-400 hover:bg-slate-100 hover:text-indigo-500 transition dark:text-slate-500 dark:hover:bg-slate-800 dark:hover:text-indigo-400"
+              className="rounded-lg p-2 min-h-[44px] min-w-[44px] md:min-h-0 md:min-w-0 text-slate-400 hover:bg-slate-100 hover:text-indigo-500 transition dark:text-slate-500 dark:hover:bg-slate-800 dark:hover:text-indigo-400"
               title="Home"
             >
               <Home className="h-4.5 w-4.5" />
             </button>
             <button
               onClick={onLogout}
-              className="rounded-lg p-2 text-slate-400 hover:bg-slate-100 hover:text-red-500 transition dark:text-slate-500 dark:hover:bg-slate-800 dark:hover:text-red-400"
+              className="rounded-lg p-2 min-h-[44px] min-w-[44px] md:min-h-0 md:min-w-0 text-slate-400 hover:bg-slate-100 hover:text-red-500 transition dark:text-slate-500 dark:hover:bg-slate-800 dark:hover:text-red-400"
               title="Logout"
             >
               <LogOut className="h-4.5 w-4.5" />
@@ -482,7 +535,7 @@ export const Layout: React.FC<LayoutProps> = ({
           <nav className="flex-1 p-3 space-y-1.5 overflow-y-auto">
             {/* Pinned shortcuts header */}
             {!collapsed && pinnedItems.length > 0 && (
-              <div className="px-3 py-1 text-[10px] font-mono font-bold text-slate-400 uppercase tracking-widest block mb-1 dark:text-slate-500">
+              <div className="px-3 py-1 text-[11px] font-mono font-bold text-slate-600 uppercase tracking-widest block mb-1 dark:text-slate-400">
                 📌 Pinned Views
               </div>
             )}
@@ -555,7 +608,7 @@ export const Layout: React.FC<LayoutProps> = ({
 
           {/* Support Branding Footer */}
           <div className="border-t border-slate-200 p-4 dark:border-slate-700">
-            <div className={`flex items-center gap-2 px-2 text-[10px] font-semibold text-slate-450 ${collapsed ? 'justify-center' : ''} dark:text-slate-500`}>
+            <div className={`flex items-center gap-2 px-2 text-[10px] font-semibold text-slate-600 ${collapsed ? 'justify-center' : ''} dark:text-slate-400`}>
               <HelpCircle className="h-4 w-4 text-slate-400 shrink-0 dark:text-slate-500" />
               {!collapsed && <span>IIT Ropar VLED Labs</span>}
             </div>
@@ -664,8 +717,8 @@ export const Layout: React.FC<LayoutProps> = ({
                   <Database className="h-5 w-5" />
                 </div>
                 <div>
-                  <h3 className="font-bold text-slate-900 dark:text-white text-base">Database Connection Manager</h3>
-                  <p className="text-xs text-slate-500 dark:text-slate-400">Manage MongoDB Atlas & Local Database Storage</p>
+                  <h3 className="font-bold text-slate-900 dark:text-white text-base">Database Storage Status</h3>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">Whether this server is using MongoDB Atlas or the local file database</p>
                 </div>
               </div>
               <button onClick={() => setShowDbModal(false)} className="p-1 rounded bg-slate-100 dark:bg-slate-800 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200">
@@ -685,68 +738,24 @@ export const Layout: React.FC<LayoutProps> = ({
                   : 'Remote MongoDB Atlas timed out or IP was not whitelisted. System is automatically running on local file DB fallback (data/db.json).'}
               </p>
             </div>
-
-            {/* Live Connect Input Form */}
-            <form onSubmit={async (e) => {
-              e.preventDefault();
-              if (!customUri.trim()) return;
-              setDbConnecting(true);
-              setDbConnectMsg(null);
-              try {
-                const res = await apiFetch('/api/db-config', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ mongodbUri: customUri.trim() })
-                });
-                const data = await res.json();
-                if (data.success) {
-                  setDbConnectMsg({ success: true, text: 'Successfully connected to MongoDB Atlas!' });
-                  setDbStatus({ connected: true, mode: 'MongoDB Atlas' });
-                } else {
-                  setDbConnectMsg({ success: false, text: data.error || 'Connection failed. Verify IP Whitelist in Atlas.' });
-                }
-              } catch (_) {
-                setDbConnectMsg({ success: false, text: 'Failed to reach server endpoint.' });
-              } finally {
-                setDbConnecting(false);
-              }
-            }} className="space-y-3 pt-2">
-              <label className="block text-xs font-bold text-slate-700 dark:text-slate-300">
-                Connect New MongoDB Atlas Connection String:
-              </label>
-              <input
-                type="text"
-                value={customUri}
-                onChange={(e) => setCustomUri(e.target.value)}
-                placeholder="mongodb+srv://user:password@cluster.mongodb.net/fln"
-                className="w-full px-3 py-2 text-xs font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-slate-900 dark:text-white focus:ring-2 focus:ring-indigo-500 outline-none"
-              />
-              
-              {dbConnectMsg && (
-                <div className={`p-2.5 rounded text-xs border font-medium ${dbConnectMsg.success ? 'bg-emerald-50 border-emerald-200 text-emerald-800' : 'bg-rose-50 border-rose-200 text-rose-800'}`}>
-                  {dbConnectMsg.text}
-                </div>
-              )}
-
-              <div className="flex justify-end gap-2 pt-2">
-                <button
-                  type="button"
-                  onClick={() => setShowDbModal(false)}
-                  className="px-4 py-2 text-xs font-semibold rounded-lg border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
-                >
-                  Close
-                </button>
-                <button
-                  type="submit"
-                  disabled={dbConnecting || !customUri.trim()}
-                  className="px-4 py-2 text-xs font-semibold rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50 transition"
-                >
-                  {dbConnecting ? 'Connecting...' : 'Connect to MongoDB'}
-                </button>
-              </div>
-            </form>
           </div>
         </div>
+      )}
+
+      {/* Support Ticket & Activity Logbook Modals */}
+      <TicketModal
+        isOpen={showTicketModal}
+        onClose={() => setShowTicketModal(false)}
+        token={token}
+        userRole={currentUser.role}
+      />
+      {canViewLogbook && (
+        <LogbookModal
+          isOpen={showLogbookModal}
+          onClose={() => setShowLogbookModal(false)}
+          token={token}
+          user={currentUser}
+        />
       )}
     </div>
   );

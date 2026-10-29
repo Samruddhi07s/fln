@@ -33,7 +33,7 @@ export function normalizeAnswer(value: unknown): string {
  */
 const PLAIN_NUMBER = /^[+-]?(\d{1,3}(,\d{3})+|\d+)(\.\d+)?$/;
 
-function asNumber(normalized: string): number | null {
+export function asNumber(normalized: string): number | null {
   if (!PLAIN_NUMBER.test(normalized)) return null;
   const n = Number(normalized.replace(/,/g, ''));
   return Number.isFinite(n) ? n : null;
@@ -72,4 +72,29 @@ export function answersMatch(submitted: unknown, expected: unknown): boolean {
   }
 
   return false;
+}
+
+/** The parts of a question needed to read a lettered answer. */
+export interface ChoiceQuestion {
+  answer: string;
+  choices?: string[];
+  answer_type?: string;
+}
+
+/**
+ * A multiple-choice question is printed as "A. 12  B. 9  C. 14  D. 7" while its
+ * stored answer is the text of the right option ("9"). A child who circles or
+ * writes the letter ("B", "b.", "(B)") gave the right answer, and a comparison
+ * of text alone would mark it wrong, which lowers the child's placement.
+ *
+ * True only for a choice question, when the answer is one letter A to D that
+ * points at an option, and that option is the expected answer. Anything else
+ * is left to the caller's own comparison, so this is only ever an addition.
+ */
+export function matchesChoiceLetter(submitted: unknown, question: ChoiceQuestion): boolean {
+  if (question.answer_type !== 'choice' || !Array.isArray(question.choices)) return false;
+  const m = /^\(?([a-d])[.)]?$/.exec(String(submitted ?? '').trim().toLowerCase());
+  if (!m) return false;
+  const picked = question.choices[m[1].charCodeAt(0) - 97];
+  return picked !== undefined && answersMatch(picked, question.answer);
 }

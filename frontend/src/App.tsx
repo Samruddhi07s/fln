@@ -22,6 +22,7 @@ import { LogbookView } from './components/LogbookView';
 import { TicketSubmission } from './components/TicketSubmission';
 import { AssessmentCalendar } from './components/AssessmentCalendar';
 import { PanelViews } from './components/PanelViews';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import MisconceptionFingerprint from './components/MisconceptionFingerprint';
 import { Bell, Settings, ShieldCheck } from 'lucide-react';
 
@@ -186,6 +187,7 @@ export default function App() {
             {currentView === 'dashboard' && currentUser && token && (
               <Layout
                 currentUser={currentUser}
+                token={token}
                 onRoleSwitch={handleRoleSwitch}
                 activeView={activePanel}
                 onSelectView={setActivePanel}
@@ -295,7 +297,9 @@ export default function App() {
                 )}
 
                 {!['workspace', 'logbook', 'tickets', 'calendar', 'settings', 'notifications', 'misconceptions'].includes(activePanel) && (
-                  <PanelViews activePanel={activePanel} currentUser={currentUser} token={token} />
+                  <ErrorBoundary label={activePanel}>
+                    <PanelViews activePanel={activePanel} currentUser={currentUser} token={token} onSelectView={setActivePanel} />
+                  </ErrorBoundary>
                 )}
 
                 {toast && (

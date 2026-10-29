@@ -1,5 +1,7 @@
 import { GoogleGenAI, Type } from "@google/genai";
 import { Question } from "./db";
+import { LEVEL_COUNT } from "./config/skillLevelMap";
+import { matchesChoiceLetter } from './answerMatching';
 
 // Valid Gemini model IDs, primary first then fallbacks (used by generateContentWithRetry).
 // Centralized here so the call sites below don't drift.
@@ -437,7 +439,7 @@ Diagnostic Questions: ${JSON.stringify(questions)}
 Student Submitted Answers: ${JSON.stringify(submittedAnswers)}
 
 Grade these answers. Compute total score out of ${questions.length}.
-Implement "Weakest-Level Mapping" (SRS §6.2): Assign the student to the lowest level (from 1 to 93) where they showed weakness or made mistakes, or level 1 if they struggle with everything. If they solved all perfectly, assign level 35.
+Implement "Weakest-Level Mapping" (SRS §6.2): Assign the student to the lowest level (from 1 to ${LEVEL_COUNT}) where they showed weakness or made mistakes, or level 1 if they struggle with everything. If they solved all perfectly, assign level 35.
 Provide a clean narrative feedback summary.`;
 
     const response = await generateContentWithRetry({
@@ -450,7 +452,7 @@ Provide a clean narrative feedback summary.`;
           type: Type.OBJECT,
           properties: {
             score: { type: Type.INTEGER, description: "Number of correct answers" },
-            recommendedLevel: { type: Type.INTEGER, description: "Level from 1 to 93 based on weakest-level mapping" },
+            recommendedLevel: { type: Type.INTEGER, description: `Level from 1 to ${LEVEL_COUNT} based on weakest-level mapping` },
             narrative: { type: Type.STRING, description: "Warm and encouraging narrative explaining how the student did and what they need to work on." }
           },
           required: ["score", "recommendedLevel", "narrative"]
@@ -478,7 +480,7 @@ Provide a clean narrative feedback summary.`;
   questions.forEach((q) => {
     const submitted = (submittedAnswers[q.question_id] || '').trim().toLowerCase();
     const correct = q.answer.trim().toLowerCase();
-    if (answersMatch(submitted, correct)) {
+    if (answersMatch(submitted, correct) || matchesChoiceLetter(submitted, q)) {
       score++;
     }
   });
@@ -488,7 +490,7 @@ Provide a clean narrative feedback summary.`;
   questions.forEach((q) => {
     const submitted = (submittedAnswers[q.question_id] || '').trim().toLowerCase();
     const correct = q.answer.trim().toLowerCase();
-    if (!answersMatch(submitted, correct)) {
+    if (!(answersMatch(submitted, correct) || matchesChoiceLetter(submitted, q))) {
       failedLevels.push(q.source_level);
     }
   });
@@ -496,9 +498,11 @@ Provide a clean narrative feedback summary.`;
   if (failedLevels.length > 0) {
     recommendedLevel = Math.min(...failedLevels);
   } else {
-    // If they got all questions correct, place them at highest level + 1 (capped at 93)
+    // If they got all questions correct, place them at highest level + 1.
+    // Capped at 59, not 93: worksheet generation (levels_main.html) still
+    // throws UnknownLevelError above 59 until the 59->93 migration finishes.
     const maxLevel = Math.max(...questions.map(q => q.source_level), 0);
-    recommendedLevel = Math.min(93, maxLevel + 1);
+    recommendedLevel = Math.min(59, maxLevel + 1);
   }
 
   return {
@@ -606,91 +610,213 @@ Each question should recommend an SVG asset from: fruits, animals, shapes, numbe
  */
 export async function evaluateAIWorksheet(
   studentName: string,
-  level: number,
   questions: Question[],
-  submittedAnswers: { [questionId: string]: string }
+  submittedAnswers: { [questionId: string]: string },
+  level: number
 ): Promise<{
   score: number;
   total: number;
-  conceptMastery: { [topic: string]: 'Strong' | 'Needs Practice' | 'Satisfactory' };
+  conceptMastery: {
+    [topic: string]: 'Strong' | 'Needs Practice' | 'Satisfactory';
+  };
   narrative: string;
-  recommendedLevel: number;
+  evaluatedQuestions: {
+    id: string;
+    isCorrect: boolean;
+    topic: string;
+  }[];
 }> {
   try {
     const prompt = `Student: ${studentName} (Current Level: ${level})
+
 Questions: ${JSON.stringify(questions)}
+
 Answers submitted: ${JSON.stringify(submittedAnswers)}
 
-Grade the student's submission. Evaluate each concept topic.
-Recommended Level progression rules:
-- If score is 80%+ (e.g. 3/3 or near perfect): Recommend Level ${Math.min(93, level + 1)}.
-- If score is 50%-80%: Retain at Level ${level}.
-- If score is < 50%: Retain at Level ${level} or suggest review at Level ${Math.max(1, level - 1)}.
-Generate a narrative report summarizing strengths and learning gaps.`;
+Evaluate the student's submission.
+
+For every question:
+- Identify the question ID.
+- Determine whether the submitted answer is correct.
+- Evaluate the student's understanding of the relevant concept.
+- Use the question topic when determining concept mastery.
+- Return exactly one evaluated result for each question.
+
+Do NOT calculate the student's FLN level.
+Do NOT recommend a next FLN level.
+Do NOT apply any level progression thresholds.
+Do NOT calculate advancement or remediation levels.
+
+The application will calculate the score and level progression separately using deterministic business rules.
+
+Provide:
+1. An evaluatedQuestions array containing the question ID, correctness, and topic for every question.
+2. Concept mastery for each topic.
+3. A concise narrative describing strengths and learning gaps.`;
 
     const response = await generateContentWithRetry({
       model: DEFAULT_GEMINI_MODEL,
       contents: prompt,
       config: {
-        systemInstruction: "You are a professional teacher grading and narrative-writing engine.",
-        responseMimeType: "application/json",
+        systemInstruction:
+          'You are a professional teacher grading and narrative-writing engine. Evaluate each student answer accurately and provide qualitative educational feedback. You may determine whether individual answers are correct, but you must not calculate scores, determine FLN level progression, recommend levels, or determine remediation levels. Level progression is handled separately by deterministic application logic.',
+
+        responseMimeType: 'application/json',
+
         responseSchema: {
           type: Type.OBJECT,
           properties: {
-            score: { type: Type.INTEGER },
+            evaluatedQuestions: {
+              type: Type.ARRAY,
+              description:
+                'Evaluation result for every submitted question.',
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  id: {
+                    type: Type.STRING,
+                    description:
+                      'The question_id of the evaluated question.'
+                  },
+                  isCorrect: {
+                    type: Type.BOOLEAN,
+                    description:
+                      'Whether the submitted answer is correct.'
+                  },
+                  topic: {
+                    type: Type.STRING,
+                    description:
+                      'The topic or concept tested by the question.'
+                  }
+                },
+                required: ['id', 'isCorrect', 'topic']
+              }
+            },
+
             conceptMastery: {
               type: Type.OBJECT,
-              description: "Mapping of topic name to: Strong, Satisfactory, or Needs Practice"
+              description:
+                'Mapping of topic name to Strong, Satisfactory, or Needs Practice.'
             },
-            narrative: { type: Type.STRING },
-            recommendedLevel: { type: Type.INTEGER }
+
+            narrative: {
+              type: Type.STRING,
+              description:
+                'Concise narrative describing strengths and learning gaps.'
+            }
           },
-          required: ["score", "conceptMastery", "narrative", "recommendedLevel"]
+
+          required: [
+            'evaluatedQuestions',
+            'conceptMastery',
+            'narrative'
+          ]
         }
       }
     });
 
-    const parsed = JSON.parse(response.text || "{}");
-    if (parsed.recommendedLevel && parsed.narrative) {
+    const parsed = JSON.parse(response.text || '{}');
+
+    if (
+      Array.isArray(parsed.evaluatedQuestions) &&
+      parsed.narrative
+    ) {
+      const evaluatedQuestions = parsed.evaluatedQuestions
+        .filter(
+          (question: any) =>
+            typeof question.id === 'string' &&
+            typeof question.isCorrect === 'boolean'
+        )
+        .map((question: any) => ({
+          id: question.id,
+          isCorrect: question.isCorrect,
+          topic:
+            typeof question.topic === 'string' && question.topic.trim()
+              ? question.topic
+              : 'General Mathematics'
+        }));
+
+      const score = evaluatedQuestions.filter(
+        question => question.isCorrect
+      ).length;
+
       return {
-        score: parsed.score ?? 0,
+        score,
         total: questions.length,
         conceptMastery: parsed.conceptMastery ?? {},
         narrative: parsed.narrative,
-        recommendedLevel: parsed.recommendedLevel
+        evaluatedQuestions
       };
     }
   } catch (error) {
-    console.error("Gemini Evaluation Engine failed, running deterministic evaluation:", error);
+    console.error(
+      'Gemini Evaluation Engine failed, running deterministic evaluation:',
+      error
+    );
   }
 
-  // Deterministic evaluation fallback
-  let score = 0;
-  const conceptMastery: { [topic: string]: 'Strong' | 'Needs Practice' | 'Satisfactory' } = {};
+  // Deterministic fallback evaluation.
+  // This fallback evaluates individual answers only.
+  // Level progression is deliberately NOT calculated here.
 
-  questions.forEach((q) => {
-    const submitted = (submittedAnswers[q.question_id] || '').trim().toLowerCase();
+  const evaluatedQuestions: {
+    id: string;
+    isCorrect: boolean;
+    topic: string;
+  }[] = [];
+
+  const conceptMastery: {
+    [topic: string]: 'Strong' | 'Needs Practice' | 'Satisfactory';
+  } = {};
+
+  questions.forEach(q => {
+    const submitted = (
+      submittedAnswers[q.question_id] || ''
+    )
+      .trim()
+      .toLowerCase();
+
     const correct = q.answer.trim().toLowerCase();
-    const isCorrect = answersMatch(submitted, correct);
 
-    if (isCorrect) score++;
+    const isCorrect = answersMatch(submitted, correct) || matchesChoiceLetter(submitted, q);
 
     const topic = q.topic || 'General Mathematics';
+
+    evaluatedQuestions.push({
+      id: q.question_id,
+      isCorrect,
+      topic
+    });
+
     if (!conceptMastery[topic]) {
-      conceptMastery[topic] = isCorrect ? 'Strong' : 'Needs Practice';
-    } else if (conceptMastery[topic] === 'Needs Practice' && isCorrect) {
+      conceptMastery[topic] = isCorrect
+        ? 'Strong'
+        : 'Needs Practice';
+    } else if (
+      conceptMastery[topic] === 'Needs Practice' &&
+      isCorrect
+    ) {
       conceptMastery[topic] = 'Satisfactory';
     }
   });
 
-  const percent = (score / questions.length) * 100;
-  const recommendedLevel = percent >= 80 ? Math.min(93, level + 1) : level;
+  const score = evaluatedQuestions.filter(
+    question => question.isCorrect
+  ).length;
+
+  const percent =
+    questions.length > 0
+      ? (score / questions.length) * 100
+      : 0;
 
   return {
     score,
     total: questions.length,
     conceptMastery,
-    recommendedLevel,
-    narrative: `Determined deterministically: ${studentName} successfully completed ${score} out of ${questions.length} questions (${percent.toFixed(0)}%). Demonstrates clear progress. Progression: recommended level is Level ${recommendedLevel}.`
+    narrative:
+      `Determined deterministically: ${studentName} successfully completed ` +
+      `${score} out of ${questions.length} questions ` +
+      `(${percent.toFixed(0)}%).`,
+    evaluatedQuestions
   };
 }

@@ -1,3 +1,4 @@
+import type { QuestionFamily } from './utils/questionFamily';
 export enum UserRole {
   SUPERADMIN = 'superadmin',
   ADMIN = 'admin',
@@ -22,6 +23,21 @@ export interface User {
   isBanned?: boolean;
 }
 
+export type MfaFactorLifecycleState = 'PENDING_ENROLLMENT' | 'ENROLLED';
+
+export interface MfaFactor {
+  factorId: string;
+  label: string;
+  algorithm: string;
+  digits: number;
+  period: number;
+  status: 'active' | 'revoked';
+  lifecycleState: MfaFactorLifecycleState;
+  createdAt: string;
+  lastUsedAt: string | null;
+  verifyAttempts: number;
+}
+
 export interface School {
   id: string;
   name: string;
@@ -31,6 +47,23 @@ export interface School {
   strength?: string;
   teachersCount: number;
   isAccessLocked?: boolean;
+  villageCity?: string;
+  addressLine1?: string;
+  addressLine2?: string;
+  landmark?: string;
+  pinCode?: string;
+  udiseCode?: string;
+  governmentSchoolCode?: string;
+  schoolType?: string;
+  managementType?: string;
+  email?: string;
+  phone?: string;
+  establishmentYear?: number;
+  initialClasses?: string[];
+  principalId?: string;
+  status?: 'active' | 'pending' | 'inactive';
+  createdAt?: string;
+  updatedAt?: string;
 }
 
 export interface ClassGroup {
@@ -80,6 +113,7 @@ export interface Question {
   answer: string;
   answer_type: 'text' | 'number' | 'choice';
   choices?: string[];
+  choiceErrorTags?: Record<string, string>;
   topic: string;
   subtopic: string;
   difficulty: 'easy' | 'medium' | 'hard';
@@ -378,9 +412,10 @@ export interface QuestionTemplate {
   levelName: string;
   skills: string[];
   subskills: string[];
+  assessmentMode?: 'written' | 'observed' | 'both';
   /** What the question should make the child do. An instruction, not a finished question. */
   generationIntent: string;
-  questionFamily: 'counting' | 'operation';
+  questionFamily: QuestionFamily;
   paramMode: 'structured' | 'legacy-free-text' | 'hybrid';
   /** Ids into the SVG manifest. The artwork lives in files, not in the database. */
   svgThemeIds: string[];
@@ -403,6 +438,8 @@ export interface QuestionTemplate {
   name: string;
   variantKey: string;
   tags: string[];
+  /** Optional canonical Balvatika error tag (Issue #626). */
+  errorTag?: string;
   source: 'form' | 'csv';
   createdBy: string;
   createdByEmail: string;
@@ -467,6 +504,7 @@ export interface ParamCatalog {
   numeralRange: string[];
   deprecatedNumeralRange?: string[];
   questionFamily?: string[];
+  assessmentMode?: string[];
   svgThemes?: SvgTheme[];
   generationIntent?: { minChars: number; maxChars: number };
   maxSvgThemes?: number;
@@ -489,6 +527,8 @@ export interface ImportResult {
   imported: number;
   rowsRead: number;
   wouldImport?: number;
+  wouldSkip?: number;
+  skippedIdentical?: number;
   errors: Array<{ row: number; error: string }>;
   error?: string;
   repeatedInFile?: Array<{ variantKey: string; count: number }>;
@@ -499,6 +539,7 @@ export interface ImportResult {
 /** Payload of `GET /api/question-logics/level-map` — drives the cascading dropdowns. */
 export interface LevelMapPayload {
   levelCount: number;
+  stages: Array<{ stage: string; label: string; firstLevel: number; lastLevel: number; levelCount: number }>;
   levels: Array<{
     levelId: string;
     levelNumber: number;
@@ -524,7 +565,7 @@ export interface LevelMapPayload {
  */
 export type LevelContentStatus = 'ready' | 'no-content' | 'unmapped';
 
-/** One row of the 93-level curriculum, as served by /api/curriculum/levels. */
+/** One row of the curriculum, as served by /api/curriculum/levels. */
 export interface CurriculumLevel {
   conceptId: string;
   levelNumber: number;

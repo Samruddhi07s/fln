@@ -1,12 +1,34 @@
 import fs from 'fs/promises';
+import { readFileSync } from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import bcrypt from 'bcrypt';
-import { MongoClient, Db } from 'mongodb';
+import { MongoClient, Db, ClientSession } from 'mongodb';
 import { CURRICULUM_MAPPING } from './config/curriculumMap';
 import type { StudentCycleLock } from './paperLock';
+import type { ScanQualityResult } from './scanQuality';
+import type { QuestionFamily } from './types/questionTemplateParams';
+import type { ErrorType } from './errorClassification';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const DB_DIR = path.resolve(process.cwd(), 'data');
 const DB_FILE = path.resolve(DB_DIR, 'db.json');
+
+// Load seed competency requirements (SRS R-7). Falls back to [] if the file
+// is missing — server still boots, but eligibility decisions will be empty
+// (cert rows never transition to 'active' until seed data is restored).
+export function getSeedCompetencyRequirements(): CompetencyRequirement[] {
+  try {
+    const seedPath = path.resolve(__dirname, 'data', 'competencyRequirements.seed.json');
+    const raw = readFileSync(seedPath, 'utf-8');
+    return JSON.parse(raw) as CompetencyRequirement[];
+  } catch (err) {
+    console.error('Failed to load seed competency requirements:', err);
+    return [];
+  }
+}
 
 // Every seeded demo account shares one password, stored ONLY as a bcrypt hash
 // (never as plaintext). Defaults to the well-known demo password shown on the login
@@ -52,820 +74,69 @@ export const connectDB = async () => {
   }
 };
 
-// Types & Interfaces corresponding to MongoDB Collections in SRS §10
-export enum UserRole {
-  SUPERADMIN = 'superadmin',
-  ADMIN = 'admin',
-  DISTRICT_ADMIN = 'district_admin',
-  BLOCK_ADMIN = 'block_admin',
-  SCHOOL = 'school',
-  TEACHER = 'teacher',
-  VOLUNTEER = 'volunteer'
-}
 
-export interface User {
-  id: string;
-  email: string;
-  name: string;
-  role: UserRole;
-  passwordHash?: string; // bcrypt hash; verified at login. Never sent to clients.
-  phoneNumber?: string;
-  stateCode?: string;
-  districtCode?: string;
-  blockCode?: string;
-  schoolId?: string;
-  assignedSchools?: string[]; // for Volunteers
-  delayedAttemptsCount?: number;
-  isBanned?: boolean;
-}
+// Domain types live in dedicated modules under backend/src. db.ts retains the
+// database implementation and re-exports the domain types for backwards
+// compatibility with existing routes and services that still import them from
+// './db'.
+export * from './identity.types';
+export * from './student.types';
+export * from './curriculum.types';
+export * from './assessment.types';
+export * from './evaluation.types';
+export * from './operations.types';
 
-export interface School {
-  id: string;
-  name: string;
-  stateCode: string;
-  districtCode: string;
-  blockCode: string;
-  strength: 'high' | 'low'; // High-strength vs. Low-strength (§1.2)
-  teachersCount: number;
-  isAccessLocked?: boolean;
-}
+import { UserRole } from './identity.types';
+import type {
+  User,
+  School,
+  ClassGroup,
+} from './identity.types';
+import type {
+  Student,
+  TestHistoryEntry,
+} from './student.types';
+import type {
+  Question,
+  QuestionBankEntry,
+  QuestionLogic,
+  QuestionTemplate,
+  QuestionOption,
+  CurriculumLevel,
+  CandidateSkill,
+  CandidateSkillStatus,
+  CandidateSkillEvidence,
+  Skill,
+  SkillSourceType,
+  SkillValidationStatus,
+} from './curriculum.types';
+import type {
+  LevelWorksheet,
+  DiagnosticAnswerKey,
+  LevelHtmlTemplate,
+  Worksheet,
+  AnswerSubmission,
+  TeacherObservationRecord,
+  WorksheetGenerationWindow,
+  AttemptRecord,
+} from './assessment.types';
+import type { EvaluationReport } from './evaluation.types';
 
-export interface ClassGroup {
-  id: string;
-  schoolId: string;
-  className: string; // e.g. "Class 2", "Class 3", "Class 4"
-  section: string; // e.g. "A", "B"
-  teacherId: string;
-}
+import type {
+  Certification,
+  CertificationStatus,
+  CompetencyRequirement,
+  MasteryLevel,
+  Ticket,
+  LogEntry,
+  Announcement,
+  Intervention,
+  BestPractice,
+  MisconceptionCluster,
+} from './operations.types';
+import { emitKeypressEvents } from 'readline';
 
-export interface Student {
-  id: string;
-  name: string;
-  age: number;
-  classGroup: string; // "Class 2" | "Class 3" | "Class 4"
-  section: string;
-  schoolId: string;
-  teacherId?: string;
-  currentLevel: number | null;
-  currentSubLevel?: number | null;
-  targetLevel: number | null;
-  aadharMasked: string; // Mandatory, unique identifier masked (§13.2 R-6)
-  // Clean numeric ID for teacher-facing display (roster, profile, printed
-  // worksheets) — see backend/src/displayId.ts. Derived from the same
-  // non-sensitive state/district/block/school/class/sequence hierarchy
-  // already encoded in `id`, just reformatted to be readable/printable.
-  // Never used as a lookup key — `id` remains the only internal identifier.
-  displayId?: string;
-  levelHistory: { level: number; subLevel?: number; date: string; reason: string }[];
-  assignedDiagnosticQuestions?: Question[];
-  // Extended profile — optional, filled in by the student's own school/teacher.
-  // guardianContact and address are PII and are redacted for roles beyond
-  // superadmin/school/teacher (same treatment as aadharMasked, §13.2 R-6).
-  gender?: 'Male' | 'Female' | 'Other';
-  dob?: string;
-  guardianName?: string;
-  guardianRelation?: string;
-  guardianContact?: string;
-  address?: string;
-  bloodGroup?: string;
-  disabilityStatus?: string;
-  midDayMealBeneficiary?: boolean;
-  busRoute?: string;
-  siblingsInSchool?: string;
-  teacherNotes?: string;
-  streak?: number;
-}
 
-export interface Question {
-  question_id: string;
-  question: string;
-  answer: string;
-  answer_type: 'text' | 'number' | 'choice';
-  choices?: string[];
-  topic: string;
-  subtopic: string;
-  difficulty: 'easy' | 'medium' | 'hard';
-  source_level: number; // Mapping to mathematical level
-  conceptId?: string; // Concept ID from 93-node framework (e.g. S1.1, S3.3)
-  svgAsset?: string; // Standard pre-built SVG asset category
-}
-
-/**
- * One rendered file coming out of the standalone Levels_backend batch
- * pipeline (POST /api/generate-batch) for a single student x sublevel x
- * set. answerKey/coords are stored verbatim (shape from that service's
- * buildCleanAnswerKey / captureCoords) so the ICR evaluation pipeline can
- * mark against the real thing instead of a placeholder.
- */
-export interface LevelWorksheet {
-  id: string;
-  batchId: string;
-  studentId: string;
-  studentName: string;
-  rollNumber: string;
-  levelId: number;
-  sublevelId: string;
-  setNum: number;
-  pdfUrl: string;
-  answerKey: any;
-  coords: any;
-  generatedAt: string;
-}
-
-export interface DiagnosticAnswerKey {
-  id: string;
-  jobId: string;
-  studentId: string;
-  studentName: string;
-  classNumber: number;
-  setNumber: number;
-  masterJson: any;
-  coords: any;
-  questionPaperJson: any;
-  questions: Question[];
-  answerKey?: any;
-  /**
-   * One physical answer region per gradable question, keyed by the real
-   * question id, measured from the rendered worksheet at generation time.
-   *
-   * Distinct from `coords` above, which is keyed by layout name and cannot be
-   * joined to a question id. This is what a scan reads: crop the region for
-   * question X, recognise what is inside it, and the result is question X's
-   * answer — no inference from ordering.
-   */
-  answerRegions?: Array<{
-    question_id: string;
-    /** Section heading the offset is measured from; found in the PDF text layer. */
-    anchor?: string;
-    dx_mm?: number;
-    dy_mm?: number;
-    page: number;
-    x_mm: number;
-    y_mm: number;
-    w_mm: number;
-    h_mm: number;
-  }>;
-  createdAt: string;
-}
-
-export interface LevelHtmlTemplate {
-  levelNumber: number;
-  title: string;
-  fileName: string;
-  htmlContent: string;
-  createdAt: string;
-}
-
-export interface QuestionBankEntry {
-  /**
-   * Stable identity, derived from (level, section, questionNumber) — verified
-   * unique across all 1202 seeded questions. Deliberately NOT derived from the
-   * question text: 314 questions share their text with another, and fixing a
-   * typo must not orphan a reviewer's mapping.
-   *
-   * This exists so review work survives a re-seed. Before it, `seedQuestionBank`
-   * did deleteMany + insertMany, so every re-seed rotated the Mongo _ids and
-   * would have silently destroyed every mapping a superadmin had made.
-   */
-  questionId: string;
-
-  level: number;
-  levelTitle: string;
-  section: string;
-  sectionType: string;
-  questionNumber: number;
-  questionText: string;
-  answer: string;
-  svgHtml: string;
-
-  // --- Review state. Written by a human, never by the seeder. ---
-
-  /** The 93-space level this question actually assesses, once a human says so. */
-  mappedLevel?: number | null;
-  /** Immutable concept tag (S1.1 - S7.18), set from the mapped level. */
-  conceptId?: string;
-  /**
-   * `untagged` — nobody has looked at it yet.
-   * `mapped`   — a human assigned it to a 93-space level.
-   * `retired`  — a human judged it not worth keeping. Kept, not deleted, so the
-   *              decision is auditable and reversible; readers must filter it out.
-   */
-  reviewStatus?: 'untagged' | 'mapped' | 'retired';
-  reviewedBy?: string;
-  reviewedAt?: string;
-  reviewNote?: string;
-}
-
-/** The one place the question identity is computed. Seeder and API must agree. */
-export function questionBankId(level: number | string, section: string, questionNumber: number | string): string {
-  return `qb_L${level}_${String(section).replace(/[^A-Za-z0-9.]+/g, '-')}_${questionNumber}`;
-}
-
-// Canonical set of assessment cycle names, used everywhere a cycle name is
-// displayed or written (levelHistory.reason, Worksheet.cycle) so there is
-// exactly one naming scheme across the whole app.
-export const CYCLE_NAMES = ['Baseline', 'Mid-year', 'End-of-year'] as const;
-export type CycleName = typeof CYCLE_NAMES[number];
-
-export interface Worksheet {
-  id: string; // Exam ID
-  classId: string;
-  className: string;
-  section: string;
-  schoolId: string;
-  generatedByRole: UserRole;
-  generatedByEmail: string;
-  cycle: CycleName;
-  date: string;
-  questions: Question[];
-  // Which students this worksheet was actually generated for — needed to
-  // compute how many are still pending evaluation (studentIds.length minus
-  // the number with a matching EvaluationReport.worksheetId). Optional so
-  // older/other worksheet-creation paths that don't set it still validate.
-  studentIds?: string[];
-  locks: {
-    locked: boolean;
-    lockedByRole: UserRole | null;
-    lockedByEmail: string | null;
-    timestamp: string | null;
-  };
-  timing: {
-    examDate: string; // e.g. "2026-07-06"
-    printWindowStart: string; // ISO String
-    printWindowEnd: string; // ISO String
-    examWindowStart: string; // ISO String
-    examWindowEnd: string; // ISO String
-    submissionWindowEnd: string; // ISO String
-  };
-  delayLogs: {
-    delayedAttemptsCount: number;
-    submittingTeachers: string[];
-  };
-}
-
-// Issue #182: one entry per bulk-generation request (diagnostic/practice/
-// remedial/midline/endline), written only from the existing bulk routes at
-// the point they already run — not a new trigger point of its own.
-export interface TestHistoryEntry {
-  id: string;
-  teacherId: string;
-  teacherEmail: string;
-  requestType: 'diagnostic' | 'practice' | 'remedial' | 'midline' | 'endline';
-  timestamp: string;
-  studentCount: number;
-  classId?: string;
-  className?: string;
-  schoolId?: string;
-}
-
-export interface AnswerSubmission {
-  id: string;
-  worksheetId: string;
-  studentId: string;
-  studentName: string;
-  schoolId: string;
-  classId: string;
-  submittedAt: string;
-  isDelayed: boolean;
-  answers: { [questionId: string]: string }; // Q1 -> A, Q2 -> 5, etc.
-  /**
-   * The paper this submission was written against, for assessments that have no
-   * persisted `Worksheet` to join to.
-   *
-   * A worksheet submission resolves its questions through `worksheetId`. A
-   * diagnostic and an ICR scan do not: both are generated per child and neither
-   * is stored as a `Worksheet`, so `answers` alone is an unreadable map of ids
-   * to strings — there is nothing to say what was asked or what the right answer
-   * was. Recording the paper here makes the submission self-describing rather
-   * than inventing synthetic `Worksheet` rows that would surface in the
-   * generation and lock screens.
-   *
-   * Optional: submissions written before this field existed, and worksheet
-   * submissions that do not need it, simply omit it.
-   */
-  questions?: Question[];
-}
-
-export type ConfidenceLevel = 'Very High' | 'High' | 'Moderate' | 'Low';
-
-export interface TeacherActionPlanStep {
-  week: number;
-  title: string;
-  topics: string[];
-}
-
-export interface PrerequisitePath {
-  weakConcepts: string[];
-  highPriorityFoundations: string[];
-  supportingSkills: string[];
-  actionPlan: TeacherActionPlanStep[];
-}
-
-export interface EvaluationReasoning {
-  explanation: {
-    headline: string;
-    narrative: string;
-  };
-  conceptMastery: { [topic: string]: 'Strong' | 'Needs Practice' | 'Satisfactory' };
-  confidence?: {
-    score: number;
-    level: ConfidenceLevel;
-    explanation: string;
-  };
-  learningProgression: {
-    currentLevel: number;
-    currentLevelName: string;
-    currentStrand: string;
-    nextMilestone: { level: number; name: string; strand: string } | null;
-    blockers: { topic: string; questionId?: string; errorType?: string }[];
-    recommendations: string[];
-  };
-  // Phase 5: Prerequisite Learning Path. Built from the same questionResults
-  // array that powers the rest of the reasoning payload, so the only source
-  // of truth is the submitted paper's correctness.
-  prerequisitePath?: PrerequisitePath;
-  prerequisiteLearningPath?: {
-    highPriorityFoundations: string[];
-    supportingSkills: string[];
-    affectedCompetencies: string[];
-    remediationSequence: string[];
-  };
-  evidence?: {
-    assessedTopics: string[];
-    strongestConcepts: string[];
-    weakestConcepts: string[];
-    failedQuestionSummary: {
-      total: number;
-      byLevel: { level: number; name: string | null; count: number; pipelineReported?: boolean }[];
-      byTopic: { topic: string; count: number }[];
-    };
-    difficultyBreakdown?: {
-      easy: { correct: number; attempted: number };
-      medium: { correct: number; attempted: number };
-      hard: { correct: number; attempted: number };
-    };
-    conceptMastery: { [topic: string]: 'Strong' | 'Needs Practice' | 'Satisfactory' };
-  };
-  remediation?: {
-    reusedFailedQuestions: number;
-    newlyIntroducedCurriculum: number;
-    remediationReason: string;
-    targetClass: number | null;
-    targetPhrase: string | null;
-  };
-  curriculumSummary?: {
-    currentLevelName: string;
-    currentObjective: string;
-    currentLearningOutcome: string[];
-    currentTopics: string[];
-    nextLevelName: string | null;
-    nextObjective: string | null;
-    transitionReason: string;
-  };
-  personalized?: {
-    failedQuestionsReused: number;
-    newLevelQuestionsAdded: number;
-    targetPhrase: string | null;
-    targetClass: number | null;
-    rationale: string;
-  };
-}
-
-export interface EvaluationReport {
-  id: string;
-  studentId: string;
-  worksheetId: string;
-  score: number;
-  totalQuestions: number;
-  totalCorrect?: number;
-  wrongCount?: number;
-  conceptMastery: { [topic: string]: 'Strong' | 'Needs Practice' | 'Satisfactory' };
-  narrative: string; // Narrative summary for parent/teacher
-  recommendedLevel: number;
-  recommendedSubLevel?: number;
-  timestamp: string;
-  /**
-   * Per-wrong-answer root causes from the Python pipeline (`ai-services`,
-   * step 2 `evaluate_child`).
-   *
-   * The pipeline has always produced these; until now the backend read only
-   * `topics_to_focus` out of its JSON and discarded the rest, so the analysis
-   * was recomputed on every diagnostic and then thrown away. Optional because
-   * the worksheet-evaluation path does not run the pipeline.
-   */
-  rootCauses?: Array<{
-    questionId: string;
-    error: string;
-    topic: string;
-    flnLevel: number;
-    /** conceptual = doesn't understand · careless = slip · prerequisite = missing foundation */
-    errorType: 'conceptual' | 'careless' | 'prerequisite' | string;
-    analysis: string;
-  }>;
-  levelsFailed?: number[];
-  prerequisitesToCheck?: string[];
-  performanceByDifficulty?: {
-    [difficulty: string]: { attempted: number; correct: number };
-  };
-  reasoning?: EvaluationReasoning;
-  // Issue #180: per-question breakdown, populated at creation time wherever
-  // the grading logic already has this data. Optional because older reports
-  // (and any evaluation path that doesn't yet populate it) predate this —
-  // the teacher-override endpoint requires it to exist on the report it's
-  // correcting, since a correction is meaningless without knowing which
-  // question is being corrected.
-  questionResults?: { questionId: string; question?: string; correctAnswer?: string; submittedAnswer: string; isCorrect: boolean }[];
-    teacherReviewed?: boolean;
-    reviewedBy?: string; // reviewing teacher's email
-    reviewedAt?: string;
-    // Per-level pass/fail breakdown for diagnostic reports — the diagnostic
-    // intentionally does NOT assign a placement level (we are heading toward
-    // analytics & reports, which read these instead). Populated wherever the
-    // grading code knows the per-question source_level.
-    passedLevels?: number[];
-    failedLevels?: number[];
-    // Skills the student is struggling with — conceptIds of the failed levels
-    // plus any direct prerequisites (so the panel can show "you have gaps in
-    // Number Sense: Counting 6-10"). Drives the status text in the diagnostic
-    // panel instead of the old hardcoded "Verified & Certified".
-    skillGaps?: { conceptId: string; level: number; levelTitle: string; strand: string }[];
-  }
-
-export interface Ticket {
-  id: string;
-  userId: string;
-  userEmail: string;
-  userName: string;
-  userRole: UserRole;
-  type: 'general' | 'curriculum';
-  subject: string;
-  description: string;
-  status: 'Open' | 'Reviewed' | 'Resolved';
-  createdAt: string;
-}
-
-export interface LogEntry {
-  id: string;
-  timestamp: string;
-  schoolId: string;
-  schoolName: string;
-  userId: string;
-  userEmail: string;
-  userRole: UserRole;
-  activityType: 'download' | 'print' | 'conduct' | 'scan' | 'verify' | 'ticket';
-  status: 'Success' | 'Failed' | 'Delayed';
-  details: string;
-}
-
-export interface Announcement {
-  id: string;
-  title: string;
-  message: string;
-  isUrgent: boolean;
-  authorEmail: string;
-  createdAt: string;
-}
-
-export type InterventionStrategyType = 'small_group' | 'one_on_one' | 'peer_tutoring' | 'visual_aids' | 'manipulatives' | 'worksheets' | 'game_based' | 'other';
-
-export interface Intervention {
-  id: string;
-  studentId: string;
-  studentName: string;
-  teacherId: string;
-  teacherName: string;
-  schoolId: string;
-  classId: string;
-  className: string;
-  section: string;
-  weakCompetencies: string[];
-  currentLevel: number;
-  strategyType: InterventionStrategyType;
-  strategyDescription: string;
-  duration: string;
-  startDate: string;
-  endDate?: string;
-  status: 'active' | 'completed' | 'pending_review';
-  outcome?: {
-    improved: boolean;
-    previousLevel: number;
-    newLevel?: number;
-    improvementDetails?: string;
-    assessmentId?: string;
-    detectedAt?: string;
-  };
-  isPromoted: boolean;
-  promotedAt?: string;
-  createdAt: string;
-}
-
-export interface BestPractice {
-  id: string;
-  interventionId: string;
-  teacherId: string;
-  teacherName: string;
-  schoolId: string;
-  weakCompetencies: string[];
-  strategyType: string;
-  strategyDescription: string;
-  levelBefore: number;
-  levelAfter: number;
-  levelJump: number;
-  duration: string;
-  tags: string[];
-  viewCount: number;
-  createdAt: string;
-}
-export interface MisconceptionCluster {
-  id: string;
-  name: string;
-  description: string;
-  teacherAction: string;
-  forwardRisk: string;
-  studentIds: string[];
-  centroid?: number[];
-  /**
-   * The class this archetype belongs to. Archetypes never span classes: the
-   * same-looking error means something different at each level (an off-by-one
-   * in Class 2 counting is not the off-by-one of Class 4 regrouping), and a
-   * teaching group a teacher can act on has to be one class they actually
-   * teach. Optional only because clusters created before this field existed
-   * carry no class; those are treated as belonging to no class and skipped.
-   */
-  classGroup?: string;
-  /**
-   * Who last renamed this archetype by hand, if anyone.
-   *
-   * Presence marks the name as human-authored, which is what stops automation
-   * from taking it back: the deterministic re-naming pass skips these outright
-   * rather than relying on the name merely not *looking* like a placeholder.
-   *
-   * Worth knowing when reading these: an archetype is scoped by `classGroup`
-   * alone and carries no `schoolId`, so a rename is visible to every school
-   * teaching that class — hence recording who did it.
-   */
-  nameSetBy?: string;
-  nameSetByRole?: UserRole;
-  nameSetAt?: string;
-  createdAt: string;
-  updatedAt: string;
-}
-
-/**
- * A Superadmin-authored instruction describing *what to ask* at a given level —
- * not a question itself. One logic is the prompt the question-generation
- * pipeline turns into many concrete `Question` rows across many worksheets.
- *
- * Deliberately a separate collection from `questions`: these have different
- * authors (human vs. generator), different consumers (generation pipeline vs.
- * renderer and ICR scanner), and different lifecycles (editable in place vs.
- * immutable once a child has answered them). Folding them together would make
- * one collection carry two incompatible lifecycles.
- */
-export interface QuestionLogic {
-  id: string;
-  /** 1..LEVEL_COUNT, L-notation. Mutable — a logic filed under the wrong level can be re-tagged. */
-  level: number;
-  /** Denormalized for display so the list view needs no join. */
-  levelName: string;
-  /** At least one. Validated server-side against the level's primary+supporting skills. */
-  skills: string[];
-  /** Optional. Empty means "assess the skill at full granularity", which is a valid choice. */
-  subskills: string[];
-  logicText: string;
-  /**
-   * Which relationship taxonomy was in force when this was authored.
-   * The project is moving from the code's 4-type model to the research's
-   * 3-type model; pinning it per-document means both can coexist through the
-   * migration instead of forcing a schema break.
-   */
-  taxonomy: '3-type' | '4-type';
-  createdBy: string;
-  createdByEmail: string;
-  createdAt: string;
-  updatedAt: string;
-  updatedBy: string;
-  updatedByEmail: string;
-  /** Soft delete: the generation pipeline may already hold this id, so the row stays for audit. */
-  deletedAt: string | null;
-  deletedBy: string | null;
-}
-
-/**
- * A Superadmin-authored question: the stem a child reads, how the answer is
- * recorded, and the constraints that govern the numbers inside it.
- *
- * Distinct from `QuestionLogic`, which described a question in prose and left
- * the generator to interpret it. A template says the same thing in fields that
- * can be validated, compared and bulk-imported, so two authors describing the
- * same variation produce the same row rather than two sentences that only a
- * human can tell apart.
- *
- * Addressed by `conceptId`, never by level number. Levels are insertable and
- * re-orderable; the concept a question assesses is not. See `CurriculumLevel`.
- */
-export interface QuestionTemplate {
-  id: string;
-
-  /** Canonical curriculum identity, e.g. "S3.4". The thing this question assesses. */
-  conceptId: string;
-  /**
-   * Display alias only, resolved from `conceptId` at write time. Never the
-   * identity: it is denormalised so the list view needs no join, and it is
-   * recomputed whenever the concept changes.
-   */
-  levelNumber: number;
-  levelName: string;
-
-  /** At least one. Validated server-side against the level's primary+supporting skills. */
-  skills: string[];
-  /** Optional. Empty means "assess the skill at full granularity", which is a valid choice. */
-  subskills: string[];
-
-  /**
-   * What the question should make the child do, in the author's words. This is
-   * an instruction to the generator, not a finished question: it names the
-   * learning action, the visual behaviour, and how the answer is given.
-   *
-   * Required for structured records. Deliberately never contains a specific
-   * number or object, so one intent can be rendered across every visual theme
-   * without being re-authored.
-   */
-  generationIntent: string;
-
-  /** Which family of question this intent produces. Governs how it is rendered. */
-  questionFamily: 'counting' | 'operation';
-
-  /**
-   * How this row was authored. `structured` rows carry a generationIntent and
-   * no authored answer. `legacy-free-text` rows predate that and carry a stem.
-   * Kept explicit so a migration never has to guess by sniffing empty strings.
-   */
-  paramMode: 'structured' | 'legacy-free-text' | 'hybrid';
-
-  /**
-   * Visual themes this intent may be drawn with, as ids into the SVG manifest.
-   * Plural because one counting intent should work across fruit, animals and
-   * vehicles; the renderer picks a variant per paper.
-   */
-  svgThemeIds: string[];
-
-  /**
-   * LEGACY. What the child reads, written out by hand. Retained read-only so
-   * rows authored before the intent model are not lost; new structured records
-   * leave it empty. Do not add new writers.
-   */
-  stem: string;
-  /**
-   * LEGACY. A hand-authored answer. Retained for the same reason as `stem`.
-   *
-   * Structured records must not carry one: the answer is produced by the
-   * generator and lives on the generated Question as an internal answer key,
-   * never as something a Superadmin typed into the authoring form.
-   */
-  answerSpec: string;
-
-  // --- Structured parameters. See backend/src/types/questionTemplateParams.ts ---
-  numeralRange: string | null;
-  digitCount: string | null;
-  /** Empty means "not specified", not "any operation". */
-  operations: string[];
-  maxOperandCount: number | null;
-  carryBehavior: string | null;
-  borrowBehavior: string | null;
-  maxSumOrDifference: string | null;
-  answerType: string | null;
-  blankCount: number | null;
-  questionCount: number | null;
-  subjectCategory: string | null;
-
-  /**
-   * Human-readable name for this variation, derived from the parameters at
-   * creation. Editable afterwards, and an edit is preserved: the derivation
-   * runs again only when an author asks for it.
-   */
-  name: string;
-  /**
-   * Fingerprint of (conceptId + parameters). Two templates constraining the
-   * same thing at the same concept share a key, which is what makes duplicate
-   * variations findable. Deliberately not a unique index — two Superadmins may
-   * legitimately author the same variation with different stems.
-   */
-  variantKey: string;
-  /** Free-form author tags, lowercased and de-duplicated on write. */
-  tags: string[];
-
-  /** Where the row came from. Bulk imports are worth being able to find again. */
-  source: 'form' | 'csv';
-
-  createdBy: string;
-  createdByEmail: string;
-  createdAt: string;
-  updatedAt: string;
-  updatedBy: string;
-  updatedByEmail: string;
-  /** Soft delete: a generated paper may already cite this id, so the row stays for audit. */
-  deletedAt: string | null;
-  deletedBy: string | null;
-}
-
-/**
- * One selectable value in the question-authoring form: a number range, an
- * operation, or a visual theme.
- *
- * These live in the database rather than in a TypeScript constant so a
- * Superadmin can add "0 to 500" without a deploy. The catalogue, the server
- * validation and the form all read these same rows, which is what stops a
- * value existing in the dropdown but being rejected on save.
- */
-export interface QuestionOption {
-  id: string;
-  type: 'numeral-range' | 'operation' | 'svg-theme';
-  /** Stable machine key, e.g. "0-500". Unique per type among active rows. */
-  key: string;
-  label: string;
-
-  /** Range bounds. Only meaningful when type is 'numeral-range'. */
-  min?: number;
-  max?: number;
-
-  /**
-   * Whether anything can actually generate with this value yet.
-   *
-   * A label in the database is not an implementation: an author can record
-   * that they want modulo questions, but the option stays out of the
-   * generation catalogue until something can produce one. This is what stops
-   * a Superadmin authoring rows that silently never generate.
-   */
-  implementationStatus: 'ready' | 'not-ready';
-
-  /** Soft delete. Values are deactivated, never removed, because rows reference them. */
-  active: boolean;
-
-  /** Marks a value we intend to retire but have not migrated off yet. */
-  deprecated?: boolean;
-
-  metadata?: Record<string, unknown>;
-
-  createdBy: string;
-  createdAt: string;
-  updatedAt: string;
-}
-
-/**
- * One row per FLN level in the canonical 93-level taxonomy.
- *
- * This collection exists to give the curriculum a single queryable home. Before
- * it, the 93 levels lived only as TypeScript in the frontend package, so every
- * backend feature that needed to reason about levels hand-authored its own copy
- * — there were six such copies at last count, in two different id spaces.
- *
- * Seeded (idempotently) by `npm run seed:levels` from
- * `frontend/src/data/skillProgressionMap.ts`. No route writes to it.
- */
-export interface CurriculumLevel {
-  /**
-   * Canonical, immutable identity. Generated once at first insert and never
-   * regenerated — student evidence points here, so renumbering would orphan it.
-   * Every other identifier on this document is an alias of this one.
-   */
-  conceptId: string;
-
-  /** L-notation, 1..93. The alias the platform standardises on. */
-  levelNumber: number;
-  /** Research S-notation, e.g. "S4.3". */
-  sCode: string;
-  /**
-   * The retired 1..59 worksheet-engine id, where one maps.
-   *
-   * Deliberately temporary: it is the bridge that lets 59-keyed content be
-   * re-keyed by lookup rather than by hand, and lets anything still speaking
-   * 59 keep working mid-migration. Null once a level has no 59-space ancestor,
-   * and the field is dropped entirely once nothing reads it.
-   */
-  legacyLevel59: number | null;
-
-  stage: string;
-  capability: string;
-  strand: string;
-
-  /** From the skill map — a level is defined by the skills it assesses. */
-  primarySkills: string[];
-  supportingSkills: string[];
-  subskills: string[];
-
-  /**
-   * Content coverage, recomputed at every seed. These are the honest answer to
-   * "how many of the 93 can we actually render today" — false is a real gap,
-   * not a defect.
-   */
-  hasStaticHtml: boolean;
-  hasBuilder: boolean;
-
-  curriculumVersion: string;
-  createdAt: string;
-  updatedAt: string;
-}
 
 interface DatabaseSchema {
   users: User[];
@@ -885,6 +156,8 @@ interface DatabaseSchema {
   interventions: Intervention[];
   bestPractices: BestPractice[];
   diagnosticAnswerKeys: DiagnosticAnswerKey[];
+  certifications: Certification[];
+  competencyRequirements: CompetencyRequirement[];
   misconceptionClusters: MisconceptionCluster[];
   testHistory: TestHistoryEntry[];
   questionLogics: QuestionLogic[];
@@ -892,6 +165,11 @@ interface DatabaseSchema {
   questionOptions: QuestionOption[];
   curriculumLevels: CurriculumLevel[];
   studentCycleLocks: StudentCycleLock[];
+  generationWindows: WorksheetGenerationWindow[];
+  teacherObservationRecords: TeacherObservationRecord[];
+  attemptRecords: AttemptRecord[];
+  candidateSkills: CandidateSkill[];
+  skills: Skill[];
 }
 
 const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
@@ -904,14 +182,16 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
   levelWorksheets: 'levelWorksheets',
   levelHtmlTemplates: 'levelHtmlTemplates',
   questionBank: 'questionBank',
-  answerSubmissions: 'answer_submissions',
-  evaluationReports: 'evaluation_reports',
+  answerSubmissions: 'answerSubmissions',
+  evaluationReports: 'evaluationReports',
   tickets: 'tickets',
   logbook: 'logbook',
   announcements: 'announcements',
   interventions: 'interventions',
-  bestPractices: 'best_practices',
+  bestPractices: 'bestPractices',
   diagnosticAnswerKeys: 'diagnostic_answer_keys',
+  certifications: 'certifications',
+  competencyRequirements: 'competencyRequirements',
   misconceptionClusters: 'misconception_clusters',
   testHistory: 'testHistory',
   questionLogics: 'questionLogics',
@@ -919,51 +199,77 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
   questionOptions: 'questionOptions',
   curriculumLevels: 'curriculumLevels',
   studentCycleLocks: 'studentCycleLocks',
+  generationWindows: 'generationWindows',
+  teacherObservationRecords: 'teacher_observation_records',
+  attemptRecords: 'attempt_records',
+  candidateSkills: 'candidate_skills',
+  skills: 'skills',
 };
 
-  /**
-   * Collapse multiple `Question` rows that share the same `question_id` into a
-   * single row, comma-joining their `answer` values so no information is lost.
-   *
-   * The diagnostic paper can be assembled from several sources (cached
-   * `assignedDiagnosticQuestions`, the freshly-generated class paper, the
-   * `questionBank` collection). When those paths overlap the same question
-   * can appear more than once. Without deduping, the OCR scan would treat
-   * the duplicate as a separate row, inflate the total count, and silently
-   * double-count correct/incorrect in the donut.
-   *
-   * Behavior:
-   *   - First occurrence of each `question_id` wins for the metadata fields
-   *     (conceptId, source_level, topic, ...).
-   *   - Subsequent duplicates contribute their `answer` value to a comma-
-   *     separated list on the merged row (de-duplicated within the join so
-   *     the same answer string isn't repeated).
-   *   - Order of the original list is preserved (first-seen order), so
-   *     downstream iteration matches the paper the student was actually shown.
-   */
-  export function dedupeQuestionsById(questions: Question[]): Question[] {
-    const byId = new Map<string, Question>();
-    const order: string[] = [];
-    for (const q of questions) {
-      const id = q.question_id;
-      if (!id) continue;
-      if (!byId.has(id)) {
-        order.push(id);
-        byId.set(id, { ...q });
-        continue;
-      }
-      const existing = byId.get(id)!;
-      const parts = new Set<string>();
-      const existingParts = String(existing.answer ?? '').split(',').map(s => s.trim()).filter(Boolean);
-      existingParts.forEach(p => parts.add(p));
-      const incoming = String(q.answer ?? '').split(',').map(s => s.trim()).filter(Boolean);
-      incoming.forEach(p => parts.add(p));
-      existing.answer = Array.from(parts).join(', ');
-    }
-    return order.map(id => byId.get(id)!);
-  }
+/**
+ * Aadhaar-sensitive fields that may ONLY be written by the tokenized creation
+ * path (routes/students.ts → createStudentFromData via addStudent). Every key
+ * that could carry a raw number, a vault reference, or the mask is listed so
+ * updateStudent()'s generic $set can never reintroduce plaintext or clobber
+ * vault references through a future, less careful caller.
+ *
+ * Deliberately broader than the Student interface: includes legacy/spelling
+ * variants (`aadhar`, `aadhaarNumber`) that a well-meaning future contributor
+ * might reach for.
+ */
+const AADHAAR_PROTECTED_UPDATE_FIELDS: readonly string[] = [
+  'aadhaar',
+  'aadhar',
+  'aadharNumber',
+  'aadhaarNumber',
+  'aadhaarTokenId',
+  'aadhaarIdentityId',
+  'aadharMasked',
+];
 
-  export class DBStore {
+/**
+ * Collapse multiple `Question` rows that share the same `question_id` into a
+ * single row, comma-joining their `answer` values so no information is lost.
+ *
+ * The diagnostic paper can be assembled from several sources (cached
+ * `assignedDiagnosticQuestions`, the freshly-generated class paper, the
+ * `questionBank` collection). When those paths overlap the same question
+ * can appear more than once. Without deduping, the OCR scan would treat
+ * the duplicate as a separate row, inflate the total count, and silently
+ * double-count correct/incorrect in the donut.
+ *
+ * Behavior:
+ *   - First occurrence of each `question_id` wins for the metadata fields
+ *     (conceptId, source_level, topic, ...).
+ *   - Subsequent duplicates contribute their `answer` value to a comma-
+ *     separated list on the merged row (de-duplicated within the join so
+ *     the same answer string isn't repeated).
+ *   - Order of the original list is preserved (first-seen order), so
+ *     downstream iteration matches the paper the student was actually shown.
+ */
+export function dedupeQuestionsById(questions: Question[]): Question[] {
+  const byId = new Map<string, Question>();
+  const order: string[] = [];
+  for (const q of questions) {
+    const id = q.question_id;
+    if (!id) continue;
+    if (!byId.has(id)) {
+      order.push(id);
+      byId.set(id, { ...q });
+      continue;
+    }
+    const existing = byId.get(id)!;
+    const parts = new Set<string>();
+    const existingParts = String(existing.answer ?? '').split(',').map(s => s.trim()).filter(Boolean);
+    existingParts.forEach(p => parts.add(p));
+    const incoming = String(q.answer ?? '').split(',').map(s => s.trim()).filter(Boolean);
+    incoming.forEach(p => parts.add(p));
+    existing.answer = Array.from(parts).join(', ');
+  }
+  return order.map(id => byId.get(id)!);
+}
+
+export class DBStore {
   private data: DatabaseSchema | null = null;
   public useMongo: boolean = false;
   private mongoDb: Db | null = null;
@@ -1026,6 +332,33 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
           await studentsColl.createIndex({ schoolId: 1 });
           await studentsColl.createIndex({ teacherId: 1 });
           await studentsColl.createIndex({ aadharMasked: 1 });
+          // Phase 2 hardening: layer-2 duplicate detection queries this field
+          // on every registration (routes/students.ts → getExistingAadhaar-
+          // IdentityIds). Deliberately NON-unique for now: legacy records may
+          // predate aadhaarIdentityId or contain duplicate values, and a
+          // unique constraint introduced blind would turn reads/writes of
+          // those rows into errors. Revisit uniqueness only after
+          // scripts/audit-aadhaar-at-rest.ts reports the data is clean.
+          await studentsColl.createIndex({ aadhaarIdentityId: 1 });
+          // Case-insensitive search indexes for the Aadhaar Reveal / admin
+          // student search. The route's $or uses BSON range ({$gte: $lt})
+          // on these six fields; the index collation lets the range scan
+          // be case-insensitive, and the index OR uses one IXSCAN per
+          // branch. Without these, an 86k-row collection would COLLSCAN
+          // on every keystroke. The same collation must be set on the
+          // cursor (see getStudents) — a strength:2 index compared with
+          // the simple-binary default ignores the index entirely.
+          // The choice of strength:2 (case + accent insensitive but
+          // still case-folded for ordering) is a deliberate compromise:
+          // full case+accent insensitive would be strength:1, but
+          // school/class identifiers do carry case information some
+          // admins rely on, and strength:1 would also make 'a' and 'ä'
+          // indistinguishable, which is wrong for names. Strength:2 is
+          // the standard for "case-insensitive prefix search".
+          const searchCollation = { locale: 'en', strength: 2 };
+          for (const f of ['name', 'displayId', 'aadharMasked', 'schoolId', 'classGroup', 'section']) {
+            await studentsColl.createIndex({ [f]: 1 }, { collation: searchCollation, name: f + '_ci' });
+          }
           console.log('Successfully ensured indexes on "students" collection');
         } catch (e: any) {
           console.warn('Failed to ensure indexes on "students" collection:', e.message);
@@ -1056,10 +389,26 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
           await templatesColl.createIndex({ variantKey: 1, deletedAt: 1 });
           await templatesColl.createIndex({ tags: 1, deletedAt: 1 });
           await templatesColl.createIndex({ paramMode: 1, deletedAt: 1 });
+          // Multikey indexes: "which questions test skill X" / "...subskill X" is a
+          // direct index lookup, not a table scan across every question×skill pair —
+          // the key-value structure this collection already is, made queryable by it.
+          await templatesColl.createIndex({ skills: 1, deletedAt: 1 });
+          await templatesColl.createIndex({ subskills: 1, deletedAt: 1 });
+          await templatesColl.createIndex({ assessmentMode: 1, deletedAt: 1 });
 
           const optionsColl = db.collection('questionOptions');
           await optionsColl.createIndex({ id: 1 }, { unique: true });
           await optionsColl.createIndex({ type: 1, active: 1 });
+
+          // Balvatika teacher-observation records (PR #517 §4/§4b) — see the
+          // TeacherObservationRecord interface for why this is a separate
+          // collection from answerSubmissions.
+          const obsColl = db.collection('teacher_observation_records');
+          await obsColl.createIndex({ id: 1 }, { unique: true });
+          await obsColl.createIndex({ studentId: 1, conceptId: 1, cycle: 1 }, { unique: true });
+          await obsColl.createIndex({ classId: 1, cycle: 1 });
+          await obsColl.createIndex({ conceptId: 1 });
+
           console.log('Successfully ensured indexes on the question authoring collections');
         } catch (e: any) {
           console.warn('Failed to ensure indexes on the question authoring collections:', e.message);
@@ -1072,6 +421,31 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
           console.log('Successfully ensured indexes on "evaluationReports" collection');
         } catch (e: any) {
           console.warn('Failed to ensure indexes on "evaluationReports" collection:', e.message);
+        }
+
+        // #479: getAttemptRecordsForStudent is the only read today, keyed
+        // by studentId.
+        try {
+          await db.collection('attempt_records').createIndex({ studentId: 1 });
+          console.log('Successfully ensured indexes on "attempt_records" collection');
+        } catch (e: any) {
+          console.warn('Failed to ensure indexes on "attempt_records" collection:', e.message);
+        }
+
+        // Ensure indexes on D1.6 candidate_skills and skills collections (#481)
+        try {
+          const candColl = db.collection('candidate_skills');
+          await candColl.createIndex({ id: 1 }, { unique: true });
+          await candColl.createIndex({ parentSkillId: 1 });
+          await candColl.createIndex({ status: 1 });
+
+          const skillsColl = db.collection('skills');
+          await skillsColl.createIndex({ id: 1 }, { unique: true });
+          await skillsColl.createIndex({ parentSkillId: 1 });
+          await skillsColl.createIndex({ validationStatus: 1 });
+          console.log('Successfully ensured indexes on "candidate_skills" and "skills" collections');
+        } catch (e: any) {
+          console.warn('Failed to ensure indexes on "candidate_skills" and "skills" collections:', e.message);
         }
 
         for (const [key, collName] of Object.entries(COLLECTION_NAMES)) {
@@ -1102,7 +476,15 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
       } catch (_) { }
       try {
         const content = await fs.readFile(DB_FILE, 'utf-8');
-        this.data = JSON.parse(content);
+        const parsed = JSON.parse(content);
+        // A db.json written before a collection was added to DatabaseSchema
+        // has no key for it, so the file-store branches below would throw on
+        // `this.data.<collection>.push(...)`. Default any missing collection
+        // to empty; COLLECTION_NAMES is typed to list every schema key.
+        for (const key of Object.keys(COLLECTION_NAMES) as (keyof DatabaseSchema)[]) {
+          if (!Array.isArray(parsed[key])) parsed[key] = [];
+        }
+        this.data = parsed;
       } catch (_) {
         this.data = this.getSeedData();
         await this.save();
@@ -1184,11 +566,26 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
     if (this.mongoDb) return await this.mongoDb.collection<School>('schools').find({}).toArray();
     return this.data?.schools || [];
   }
+  async getSchoolById(id: string): Promise<School | null> {
+    if (!id) return null;
+    if (this.mongoDb) return (await this.mongoDb.collection<School>('schools').findOne({ id })) as School | null;
+    return (this.data?.schools || []).find(sc => sc.id === id) ?? null;
+  }
   async getClasses() {
     if (this.mongoDb) return await this.mongoDb.collection<ClassGroup>('classes').find({}).toArray();
     return this.data?.classes || [];
   }
-  async getStudents(opts?: { limit?: number; offset?: number; schoolId?: string | string[]; teacherId?: string }) {
+  async getStudents(opts?: { limit?: number; offset?: number; schoolId?: string | string[]; teacherId?: string; sort?: 'latest'; q?: string }) {
+    // Search must run BEFORE limit/offset. A previous version of this
+    // function only sorted/paged, and the caller (routes/students.ts)
+    // applied the search AFTER the paged result had been returned. On an
+    // 86,400-row collection that meant a search match at position 500
+    // would never appear in the page (the first 10 were the 10 most-recent
+    // inserts, with no guarantee any of them matched). The result was a
+    // panel that "did nothing" as the user typed. Pushing the search
+    // here means the same query Mongo/JS does is also the one that
+    // pagination slices.
+    const search = (opts?.q || '').trim().toLowerCase();
     if (this.mongoDb) {
       const filter: any = {};
       if (opts?.schoolId) {
@@ -1199,16 +596,86 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
         }
       }
       if (opts?.teacherId) filter.teacherId = opts.teacherId;
+      if (search) {
+        // Case-insensitive PREFIX match on the same six fields the panel
+        // advertises. The previous version used an unanchored case-insensitive
+        // regex (e.g. /foo/i), which CANNOT use a B-tree index in this
+        // MongoDB version — every keystroke COLLSCAN'd the 86k-row
+        // collection. The fix is a BSON range { $gte: prefix, $lt: prefix+'￿' }
+        // combined with a strength:2 collation on the cursor. Combined with
+        // the matching collation-aware indexes (see the `init()` block
+        // above), Mongo uses index OR (one IXSCAN per $or branch) and the
+        // search runs in single-digit ms.
+        //
+        // The semantic change is "prefix" instead of "substring" — typing
+        // "kar" still finds "Kartik", but typing "artik" no longer matches
+        // "Kartik" via a mid-string substring. This is the smallest
+        // architecturally correct change that preserves the user-typed
+        // search box; the API contract (the ?q= parameter) is unchanged.
+        // The in-memory (file-fallback) path below mirrors this with
+        // .startsWith() so dev and prod return the same results.
+        const prefix = search;
+        const upper = prefix + '￿';
+        filter.$or = [
+          { name:        { $gte: prefix, $lt: upper } },
+          { displayId:   { $gte: prefix, $lt: upper } },
+          { aadharMasked:{ $gte: prefix, $lt: upper } },
+          { schoolId:    { $gte: prefix, $lt: upper } },
+          { classGroup:  { $gte: prefix, $lt: upper } },
+          { section:     { $gte: prefix, $lt: upper } },
+        ];
+      }
       const skip = opts?.offset || 0;
       const limit = opts?.limit || 0;
       const cursor = this.mongoDb.collection<Student>('students').find(filter);
+      // When the query has a search, use the same collation as the
+      // `*_ci` indexes above. Without this, Mongo falls back to the
+      // simple-binary collation, the index OR is unusable, and we
+      // COLLSCAN the whole collection. With it, index OR turns 6
+      // COLLSCANs into 6 IXSCANs (~1ms each on 86k rows).
+      if (search) cursor.collation({ locale: 'en', strength: 2 });
+      // `sort: 'latest'` returns most-recently-inserted first. In Mongo
+      // the natural `_id` ObjectId is time-prefixed, so a descending
+      // sort gives the same intent as "newest at the top" in the
+      // file-fallback store (where students are `push`ed to the array
+      // and we reverse the result). Other sort modes are intentionally
+      // not exposed — the route layer is the only place that names
+      // sort orders.
+      if (opts?.sort === 'latest') cursor.sort({ _id: -1 });
       if (skip) cursor.skip(skip);
       if (limit) cursor.limit(limit);
       return await cursor.toArray();
     }
     let result = this.data?.students || [];
-    if (opts?.schoolId) result = result.filter(s => s.schoolId === opts.schoolId);
+    if (opts?.schoolId) {
+      const wanted = Array.isArray(opts.schoolId) ? opts.schoolId : [opts.schoolId];
+      result = result.filter(s => wanted.includes(s.schoolId));
+    }
     if (opts?.teacherId) result = result.filter(s => s.teacherId === opts.teacherId);
+    if (search) {
+      // Same six fields, same case-insensitive PREFIX semantics as the
+      // Mongo $or above (see comment in the Mongo branch). The previous
+      // version used `.includes()` (substring); the new Mongo path is
+      // BSON range + collation, which is prefix-only. We mirror that
+      // here with `.startsWith()` so dev (file-fallback) and prod
+      // (Mongo) return the same rows for the same `q` — otherwise a
+      // dev who types "artik" sees "Kartik" in their file-fallback
+      // results but a prod deploy would not, and vice versa.
+      result = result.filter(s => {
+        const fields = [
+          s.name, s.displayId, s.aadharMasked, s.schoolId, s.classGroup, s.section,
+        ];
+        for (const v of fields) {
+          if (v != null && String(v).toLowerCase().startsWith(search)) return true;
+        }
+        return false;
+      });
+    }
+    // For the file-fallback store, students are appended to the array
+    // on insert, so the array is in chronological order. Reversing it
+    // gives "latest first" — matching the Mongo sort({ _id: -1 })
+    // path.
+    if (opts?.sort === 'latest') result = [...result].reverse();
     if (opts?.offset) result = result.slice(opts.offset);
     if (opts?.limit) result = result.slice(0, opts.limit);
     return result;
@@ -1226,16 +693,58 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
     }
     return (this.data?.students || []).find(s => s.id === id) || null;
   }
-  async countStudents(opts?: { schoolId?: string; teacherId?: string }) {
+  async countStudents(opts?: { schoolId?: string | string[]; teacherId?: string; q?: string }) {
+    // Mirrors getStudents' search semantics so the route's X-Total-Count
+    // header reflects the full match count, not the post-pagination
+    // page count. The previous version took no `q` and the route fell
+    // back to `masked.length` (the post-page count) — same
+    // whole-collection / first-page mismatch that broke the search.
+    const search = (opts?.q || '').trim().toLowerCase();
     if (this.mongoDb) {
       const filter: any = {};
-      if (opts?.schoolId) filter.schoolId = opts.schoolId;
+      if (opts?.schoolId) filter.schoolId = Array.isArray(opts.schoolId) ? { $in: opts.schoolId } : opts.schoolId;
       if (opts?.teacherId) filter.teacherId = opts.teacherId;
+      if (search) {
+        // Mirror the BSON-range + collation pattern from getStudents
+        // exactly. countStudents drives the route's X-Total-Count
+        // header, and it MUST match the page's filter — otherwise
+        // pagination shows the wrong total. With the same $or and
+        // the same collation, Mongo uses the same six IXSCANs as
+        // the find, so the count is also single-digit ms on 86k rows.
+        const prefix = search;
+        const upper = prefix + '￿';
+        filter.$or = [
+          { name:        { $gte: prefix, $lt: upper } },
+          { displayId:   { $gte: prefix, $lt: upper } },
+          { aadharMasked:{ $gte: prefix, $lt: upper } },
+          { schoolId:    { $gte: prefix, $lt: upper } },
+          { classGroup:  { $gte: prefix, $lt: upper } },
+          { section:     { $gte: prefix, $lt: upper } },
+        ];
+      }
+      // Same collation as the find; required for the *_ci indexes.
+      // Without the search path, countDocuments hits the existing
+      // schoolId/teacherId indexes and does not need a collation.
+      if (search) {
+        return await this.mongoDb.collection('students').countDocuments(filter, { collation: { locale: 'en', strength: 2 } });
+      }
       return await this.mongoDb.collection('students').countDocuments(filter);
     }
     let result = this.data?.students || [];
-    if (opts?.schoolId) result = result.filter(s => s.schoolId === opts.schoolId);
+    if (opts?.schoolId) { const ids = ([] as string[]).concat(opts.schoolId); result = result.filter(s => ids.includes(s.schoolId)); }
     if (opts?.teacherId) result = result.filter(s => s.teacherId === opts.teacherId);
+    if (search) {
+      // Same prefix-only semantics as getStudents' in-memory path.
+      result = result.filter(s => {
+        const fields = [
+          s.name, s.displayId, s.aadharMasked, s.schoolId, s.classGroup, s.section,
+        ];
+        for (const v of fields) {
+          if (v != null && String(v).toLowerCase().startsWith(search)) return true;
+        }
+        return false;
+      });
+    }
     return result.length;
   }
 
@@ -1346,10 +855,100 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
     return counts;
   }
 
+  /**
+   * Per-school evaluation aggregates, for the executive school table.
+   *
+   * One pipeline over `students` (indexed on `schoolId`) that looks each
+   * child's reports up through the `evaluationReports.studentId` index, so
+   * the whole table costs a single server-side query rather than one query
+   * per school.
+   *
+   * A report counts as passed when the child got at least half the questions
+   * right. `score` is a correct-answer count on every production writer
+   * (routes/evaluation.ts, routes/students.ts, the teacher-override endpoint)
+   * measured against `totalQuestions`, so the ratio — not a raw
+   * `score >= 50` — is the comparison that holds across papers of any length.
+   * This is the same normalisation WorksheetsPanel.tsx already uses.
+   */
+  async getSchoolEvaluationStats(): Promise<Map<string, { students: number; assessedStudents: number; reports: number; passed: number }>> {
+    const empty = () => ({ students: 0, assessedStudents: 0, reports: 0, passed: 0 });
+    if (this.mongoDb) {
+      // Reads `evaluationReports` — the collection every live writer targets
+      // (addEvaluationReport, updateEvaluationReport, getEvaluationReports,
+      // and the studentId index in ensureIndexes).
+      const result = await this.mongoDb.collection('students').aggregate([
+        { $lookup: { from: 'evaluationReports', localField: 'id', foreignField: 'studentId', as: 'reports' } },
+        {
+          $project: {
+            schoolId: 1,
+            reportCount: { $size: '$reports' },
+            passedCount: {
+              $size: {
+                $filter: {
+                  input: '$reports',
+                  as: 'r',
+                  // $cond rather than $and so the divide is only evaluated when
+                  // totalQuestions is non-zero — $and does not short-circuit
+                  // and $divide by zero is an error, not a null.
+                  cond: {
+                    $cond: [
+                      { $gt: [{ $ifNull: ['$$r.totalQuestions', 0] }, 0] },
+                      { $gte: [{ $divide: ['$$r.score', '$$r.totalQuestions'] }, 0.5] },
+                      false,
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          $group: {
+            _id: '$schoolId',
+            students: { $sum: 1 },
+            assessedStudents: { $sum: { $cond: [{ $gt: ['$reportCount', 0] }, 1, 0] } },
+            reports: { $sum: '$reportCount' },
+            passed: { $sum: '$passedCount' },
+          }
+        }
+      ]).toArray();
+      const map = new Map<string, { students: number; assessedStudents: number; reports: number; passed: number }>();
+      result.forEach((r: any) => {
+        if (!r._id) return;
+        map.set(r._id, { students: r.students, assessedStudents: r.assessedStudents, reports: r.reports, passed: r.passed });
+      });
+      return map;
+    }
+    // JSON fallback store: the same four numbers, over the in-memory copy.
+    const stats = new Map<string, { students: number; assessedStudents: number; reports: number; passed: number }>();
+    const schoolByStudent = new Map<string, string>();
+    (this.data?.students || []).forEach(s => {
+      if (!s.schoolId) return;
+      schoolByStudent.set(s.id, s.schoolId);
+      const row = stats.get(s.schoolId) || empty();
+      row.students += 1;
+      stats.set(s.schoolId, row);
+    });
+    const assessed = new Set<string>();
+    (this.data?.evaluationReports || []).forEach(r => {
+      const schoolId = schoolByStudent.get(r.studentId);
+      if (!schoolId) return;
+      const row = stats.get(schoolId)!;
+      // Distinct students, so a child assessed several times still counts once.
+      if (!assessed.has(r.studentId)) {
+        assessed.add(r.studentId);
+        row.assessedStudents += 1;
+      }
+      row.reports += 1;
+      if ((r.totalQuestions || 0) > 0 && r.score / r.totalQuestions >= 0.5) row.passed += 1;
+    });
+    return stats;
+  }
+
   /** Fast aggregation: count of evaluation reports. */
   async countReports(): Promise<number> {
     if (this.mongoDb) {
-      return await this.mongoDb.collection('evaluation_reports').countDocuments({});
+      return await this.mongoDb.collection('evaluationReports').countDocuments({});
     }
     return (this.data?.evaluationReports || []).length;
   }
@@ -1357,7 +956,7 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
   /** Fast aggregation: count reports grouped by pass/fail (score >= 50). */
   async countReportsByOutcome(): Promise<{ pass: number; fail: number; total: number; avgScore: number }> {
     if (this.mongoDb) {
-      const result = await this.mongoDb.collection('evaluation_reports').aggregate([
+      const result = await this.mongoDb.collection('evaluationReports').aggregate([
         {
           $group: {
             _id: null,
@@ -1384,9 +983,20 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
     if (this.mongoDb) return await this.mongoDb.collection<Worksheet>('worksheets').find({}).toArray();
     return this.data?.worksheets || [];
   }
+  /** Worksheets with the given ids; used to resolve the questions behind a student's evaluation reports. */
+  async getWorksheetsByIds(ids: string[]): Promise<Worksheet[]> {
+    if (ids.length === 0) return [];
+    if (this.mongoDb) return await this.mongoDb.collection<Worksheet>('worksheets').find({ id: { $in: ids } }).toArray();
+    const wanted = new Set(ids);
+    return (this.data?.worksheets || []).filter(w => wanted.has(w.id));
+  }
   async getStudentCycleLocks() {
     if (this.mongoDb) return await this.mongoDb.collection<StudentCycleLock>('studentCycleLocks').find({}).toArray();
     return this.data?.studentCycleLocks || [];
+  }
+    async getGenerationWindows() {
+    if (this.mongoDb) return await this.mongoDb.collection<WorksheetGenerationWindow>('generationWindows').find({}).toArray();
+    return this.data?.generationWindows || [];
   }
   async getTestHistory(teacherId?: string) {
     if (this.mongoDb) {
@@ -1424,22 +1034,77 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
   }
 
   /**
-     * Level range for a given class, per the 93-level FLN registry
+   * Returns all records from the canonical Question Bank (used for admin audit & integrity check).
+   * Queries MongoDB collection `questionBank` if connected; falls back to loading canonical
+   * data/questionBank.json in local file-DB mode or if Atlas is unseeded.
+   */
+  async getAllQuestionBank(): Promise<QuestionBankEntry[]> {
+    if (this.mongoDb) {
+      try {
+        const items = await this.mongoDb.collection<QuestionBankEntry>('questionBank').find({}).sort({ level: 1, questionNumber: 1 }).toArray();
+        if (items && items.length > 0) {
+          return items;
+        }
+      } catch (err: any) {
+        console.warn('Failed to query questionBank from MongoDB, attempting local fallback:', err?.message || err);
+      }
+    }
+    if (this.data?.questionBank && this.data.questionBank.length > 0) {
+      return this.data.questionBank;
+    }
+    // Fallback: load from canonical data/questionBank.json
+    try {
+      const candidates = [
+        path.resolve(__dirname, '../../data/questionBank.json'),
+        path.resolve(__dirname, '../../../data/questionBank.json'),
+        path.resolve(process.cwd(), 'data', 'questionBank.json'),
+        path.resolve(process.cwd(), '..', 'data', 'questionBank.json'),
+      ];
+      for (const p of candidates) {
+        try {
+          const content = await fs.readFile(p, 'utf-8');
+          const parsed = JSON.parse(content);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            if (this.data) this.data.questionBank = parsed;
+            return parsed;
+          }
+        } catch {
+          // continue checking next candidate path
+        }
+      }
+    } catch (err: any) {
+      console.error('Failed to load canonical questionBank.json:', err?.message || err);
+    }
+    return [];
+  }
+
+  /**
+     * Level range for a given class, per the FLN registry
      * (see backend/src/config/curriculumMap.ts).
      *
-     *   Pre-school 1:  1-7
-     *   Pre-school 2:  8-17
-     *   Pre-school 3: 18-27
-     *   Class 1:      28-42
-     *   Class 2:      43-61
-     *   Class 3:      62-75
-     *   Class 4:      76-93
+     * Updated 2026-09-18 for PR #517 (the year-before-Class-1/"Balvatika" stage
+     * finalisation against NCF-FS), which added 15 nodes and moved 4 nodes into
+     * Stage 3, shifting every boundary below from L28 onward. The registry is
+     * now 109 levels, not 93 (L-to-S crosswalk, PR #554).
+     *
+     *   Pre-school 1:            1-8
+     *   Pre-school 2:            9-18
+     *   Year before Class 1:    19-46   (Pre-school 3, the Balvatika stage — see curriculumMap.ts)
+     *   Class 1:                47-60
+     *   Class 2:                61-77
+     *   Class 3:                78-91
+     *   Class 4:                92-109
+     *
+     * classNumber here is documented (db.ts CertificationEligibility etc.) as 2-4
+     * per SRS §3 — the classNumber<=1 branch exists but Class 1 / the year-before
+     * stage are not yet wired into real paper generation (see PR #517 §9: student
+     * + teacher-observation worksheet generation for that stage is still to be built).
      */
   static classLevelRange(classNumber: number): { min: number; max: number } {
-    if (classNumber <= 1) return { min: 28, max: 42 }; // class 1
-    if (classNumber === 2) return { min: 43, max: 61 };
-    if (classNumber === 3) return { min: 62, max: 75 };
-    return { min: 76, max: 93 }; // class 4 (and any >4 default)
+    if (classNumber <= 1) return { min: 47, max: 60 }; // class 1
+    if (classNumber === 2) return { min: 61, max: 77 };
+    if (classNumber === 3) return { min: 78, max: 91 };
+    return { min: 92, max: 109 }; // class 4 (and any >4 default)
   }
 
   /**
@@ -1665,7 +1330,12 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
     let schoolIds: string[] | null = null;
     if (schoolFilter && Object.keys(schoolFilter).length > 0) {
       schoolIds = schools.filter(s => {
-        return Object.entries(schoolFilter).every(([k, v]) => (s as any)[k] === v);
+        return Object.entries(schoolFilter).every(([k, v]) => {
+          if (v && typeof v === 'object' && Array.isArray((v as any).$in)) {
+            return (v as any).$in.includes((s as any)[k]);
+          }
+          return (s as any)[k] === v;
+        });
       }).map(s => s.id);
     }
 
@@ -1763,12 +1433,23 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
   // --- Write / Update Helpers ---
 
   async addUser(user: User) {
-    await this.mongoDb!.collection('users').insertOne(user);
-    if (this.data) this.data.users.push(user);
+    if (this.mongoDb) await this.mongoDb.collection('users').insertOne(user);
+    if (this.data) {
+      this.data.users.push(user);
+      if (!this.mongoDb) await this.save();
+    }
     return user;
   }
 
   async updateUserPasswordHash(userId: string, passwordHash: string) {
+    if (!this.mongoDb) {
+      const u = this.data?.users.find(x => x.id === userId);
+      if (u) {
+        u.passwordHash = passwordHash;
+        await this.save();
+      }
+      return;
+    }
     await this.mongoDb!.collection('users').updateOne({ id: userId }, { $set: { passwordHash } });
   }
 
@@ -1782,6 +1463,49 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
     const set = new Set<string>();
     (this.data?.students || []).forEach(s => {
       if (aadhars.includes(s.aadharMasked)) set.add(s.aadharMasked);
+    });
+    return set;
+  }
+
+  /**
+   * School-scoped variant of `getExistingAadhars`. Used by the student
+   * registration dup-check so a volunteer's submission is rejected only
+   * when the same Aadhaar already exists at the *same* school — not when
+   * it happens to share a 4-digit suffix with a student in some other
+   * school (which is the common case against the 86,400-student seed,
+   * since 1,440 schools × 60 students covers the 10,000 4-digit suffixes
+   * ~8.6×). The cross-school "is this the same person?" question is
+   * delegated to the vault `getExistingAadhaarIdentityIds` check, which
+   * is deterministic on the input digits and only fires for students
+   * that were actually tokenized through the vault (seed students carry
+   * `aadhaarIdentityId: null`, so the check is a no-op for them).
+   */
+  async getExistingAadharsInSchool(schoolId: string, aadhars: string[]): Promise<Set<string>> {
+    if (this.mongoDb) {
+      const docs = await this.mongoDb.collection('students')
+        .find({ schoolId, aadharMasked: { $in: aadhars } }, { projection: { aadharMasked: 1 } })
+        .toArray();
+      return new Set(docs.map(d => d.aadharMasked));
+    }
+    const set = new Set<string>();
+    (this.data?.students || []).forEach(s => {
+      if (s.schoolId === schoolId && aadhars.includes(s.aadharMasked)) set.add(s.aadharMasked);
+    });
+    return set;
+  }
+
+  async getExistingAadhaarIdentityIds(identityIds: string[]): Promise<Set<string>> {
+    const cleanIds = identityIds.filter(Boolean);
+    if (cleanIds.length === 0) return new Set<string>();
+    if (this.mongoDb) {
+      const docs = await this.mongoDb.collection('students')
+        .find({ aadhaarIdentityId: { $in: cleanIds } }, { projection: { aadhaarIdentityId: 1 } })
+        .toArray();
+      return new Set(docs.map(d => d.aadhaarIdentityId).filter(Boolean));
+    }
+    const set = new Set<string>();
+    (this.data?.students || []).forEach(s => {
+      if (s.aadhaarIdentityId && cleanIds.includes(s.aadhaarIdentityId)) set.add(s.aadhaarIdentityId);
     });
     return set;
   }
@@ -1839,9 +1563,59 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
     }
   }
 
+  async ensureClassesExist(schoolId: string, classNames: string[], section: string, teacherId: string) {
+    const classes: ClassGroup[] = classNames.map(className => ({
+      id: 'c_' + schoolId + '_' + className.replace(/\s+/g, '') + '_' + section,
+      schoolId,
+      className,
+      section,
+      teacherId,
+    }));
+    if (this.mongoDb && classes.length > 0) {
+      await this.mongoDb.collection<ClassGroup>('classes').bulkWrite(classes.map(cls => ({
+        updateOne: {
+          filter: { id: cls.id },
+          update: { $setOnInsert: cls },
+          upsert: true,
+        },
+      })));
+    }
+    if (this.data) {
+      for (const cls of classes) {
+        if (!this.data.classes.some(existing => existing.id === cls.id)) this.data.classes.push(cls);
+      }
+      if (!this.mongoDb && classes.length > 0) await this.save();
+    }
+  }
+
   async updateStudent(studentId: string, updates: Partial<Student>) {
-    await this.mongoDb!.collection('students').updateOne({ id: studentId }, { $set: updates });
-    const s = await this.mongoDb!.collection<Student>('students').findOne({ id: studentId });
+    // Defense-in-depth (Phase 2 hardening): routes whitelist their fields
+    // today, but this mutator accepts any Partial<Student>. Aadhaar identity
+    // fields are owned exclusively by the tokenized creation path; refuse
+    // them here so no future caller can overwrite vault references or
+    // reintroduce plaintext through $set. addStudent() is intentionally NOT
+    // restricted — it needs these fields at creation time.
+    const blocked = Object.keys(updates).filter(k => AADHAAR_PROTECTED_UPDATE_FIELDS.includes(k));
+    if (blocked.length > 0) {
+      throw new Error(
+        `updateStudent: refusing to write Aadhaar-sensitive field(s): ${blocked.join(', ')}. `
+        + 'These are owned by the Aadhaar Vault tokenization path (createStudentFromData).',
+      );
+    }
+    // Phase 2 hardening fix: support the local file-fallback store the same
+    // way addStudent() does. The previous unconditional `this.mongoDb!`
+    // crashed every level/profile PATCH when MongoDB was absent.
+    if (!this.mongoDb) {
+      const list = this.data?.students;
+      if (!list) return undefined;
+      const idx = list.findIndex(x => x.id === studentId);
+      if (idx === -1) return undefined;
+      list[idx] = { ...list[idx], ...updates };
+      await this.save();
+      return list[idx];
+    }
+    await this.mongoDb.collection('students').updateOne({ id: studentId }, { $set: updates });
+    const s = await this.mongoDb.collection<Student>('students').findOne({ id: studentId });
     if (s && this.data) {
       const idx = this.data.students.findIndex(x => x.id === studentId);
       if (idx !== -1) this.data.students[idx] = s;
@@ -1850,6 +1624,13 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
   }
 
   async addWorksheet(ws: Worksheet) {
+    if (!this.mongoDb) {
+      if (this.data) {
+        this.data.worksheets.push(ws);
+        await this.save();
+      }
+      return ws;
+    }
     await this.mongoDb!.collection('worksheets').insertOne(ws);
     if (this.data) this.data.worksheets.push(ws);
     return ws;
@@ -1860,7 +1641,33 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
     if (this.data) this.data.studentCycleLocks.push(lock);
     return lock;
   }
+  async addGenerationWindow(window: WorksheetGenerationWindow) {
+    if (this.mongoDb) await this.mongoDb.collection('generationWindows').insertOne(window);
+    if (this.data) this.data.generationWindows.push(window);
+    return window;
+  }
+  async updateGenerationWindow(
+    id: string,
+    updates: Partial<WorksheetGenerationWindow>
+  ) {
+    if (this.mongoDb) {
+      await this.mongoDb.collection<WorksheetGenerationWindow>('generationWindows').updateOne(
+        { id },
+        { $set: updates }
+      );
+    }
 
+    if (this.data) {
+      const index = this.data.generationWindows.findIndex(window => window.id === id);
+
+      if (index !== -1) {
+        this.data.generationWindows[index] = {
+          ...this.data.generationWindows[index],
+          ...updates
+        };
+      }
+    }
+  }
   async addTestHistoryEntry(entry: TestHistoryEntry) {
     if (this.mongoDb) {
       await this.mongoDb.collection('testHistory').insertOne(entry);
@@ -1870,6 +1677,15 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
   }
 
   async updateWorksheet(worksheetId: string, updates: Partial<Worksheet>) {
+    if (!this.mongoDb) {
+      const list = this.data?.worksheets;
+      if (!list) return undefined;
+      const idx = list.findIndex(x => x.id === worksheetId);
+      if (idx === -1) return undefined;
+      list[idx] = { ...list[idx], ...updates };
+      await this.save();
+      return list[idx];
+    }
     await this.mongoDb!.collection('worksheets').updateOne({ id: worksheetId }, { $set: updates });
     const ws = await this.mongoDb!.collection<Worksheet>('worksheets').findOne({ id: worksheetId });
     if (ws && this.data) {
@@ -1880,21 +1696,126 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
   }
 
   async addLevelWorksheet(ws: LevelWorksheet) {
+    if (!this.mongoDb) {
+      if (this.data) {
+        this.data.levelWorksheets.push(ws);
+        await this.save();
+      }
+      return ws;
+    }
     await this.mongoDb!.collection('levelWorksheets').insertOne(ws);
     if (this.data) this.data.levelWorksheets.push(ws);
     return ws;
   }
 
   async addAnswerSubmission(sub: AnswerSubmission) {
+    if (!this.mongoDb) {
+      if (this.data) {
+        this.data.answerSubmissions.push(sub);
+        await this.save();
+      }
+      return sub;
+    }
     await this.mongoDb!.collection('answerSubmissions').insertOne(sub);
     if (this.data) this.data.answerSubmissions.push(sub);
     return sub;
   }
 
   async addEvaluationReport(rep: EvaluationReport) {
+    if (!this.mongoDb) {
+      if (this.data) {
+        this.data.evaluationReports.push(rep);
+        await this.save();
+      }
+      return rep;
+    }
     await this.mongoDb!.collection('evaluationReports').insertOne(rep);
     if (this.data) this.data.evaluationReports.push(rep);
     return rep;
+  }
+
+  // --- Certification (SRS R-7) ---
+
+  async getCertifications(): Promise<Certification[]> {
+    if (this.mongoDb) return await this.mongoDb.collection<Certification>('certifications').find({}).toArray();
+    return this.data?.certifications || [];
+  }
+
+  async getCertificationById(certId: string): Promise<Certification | null> {
+    if (this.mongoDb) return await this.mongoDb.collection<Certification>('certifications').findOne({ id: certId });
+    return this.data?.certifications.find(c => c.id === certId) || null;
+  }
+
+  async getCertificationByStudentClassLevel(studentId: string, classNumber: number, level: number): Promise<Certification | null> {
+    const list = this.mongoDb
+      ? await this.mongoDb.collection<Certification>('certifications').find({ studentId, classNumber, level }).toArray()
+      : (this.data?.certifications || []).filter(c => c.studentId === studentId && c.classNumber === classNumber && c.level === level);
+    // Prefer active > review_needed > revoked (most-recent verdict wins for orchestrator)
+    const priority: Record<CertificationStatus, number> = { active: 0, review_needed: 1, revoked: 2 };
+    return list.sort((a, b) => priority[a.status] - priority[b.status])[0] || null;
+  }
+
+  async addCertification(cert: Certification) {
+    if (!this.mongoDb) {
+      if (this.data) {
+        this.data.certifications.push(cert);
+        await this.save();
+      }
+      return cert;
+    }
+    await this.mongoDb!.collection('certifications').insertOne(cert);
+    if (this.data) this.data.certifications.push(cert);
+    return cert;
+  }
+
+  async updateCertification(certId: string, updates: Partial<Certification>) {
+    if (!this.mongoDb) {
+      const list = this.data?.certifications;
+      if (!list) return undefined;
+      const idx = list.findIndex(x => x.id === certId);
+      if (idx === -1) return undefined;
+      list[idx] = { ...list[idx], ...updates };
+      await this.save();
+      return list[idx];
+    }
+    await this.mongoDb!.collection('certifications').updateOne({ id: certId }, { $set: updates });
+    if (this.mongoDb) {
+      return await this.mongoDb.collection<Certification>('certifications').findOne({ id: certId });
+    }
+  }
+
+  /** Optimistic concurrency: only update if version still matches. Returns null if no match. */
+  async updateCertificationIfVersion(certId: string, expectedVersion: number, updates: Partial<Certification>) {
+    if (this.mongoDb) {
+      const result = await this.mongoDb.collection<Certification>('certifications').findOneAndUpdate(
+        { id: certId, version: expectedVersion },
+        { $set: updates, $inc: { version: 1 } },
+        { returnDocument: 'after' }
+      );
+      return result || null;
+    }
+    if (this.data) {
+      const idx = this.data.certifications.findIndex(c => c.id === certId && c.version === expectedVersion);
+      if (idx === -1) return null;
+      this.data.certifications[idx] = { ...this.data.certifications[idx], ...updates, version: this.data.certifications[idx].version + 1 };
+      await this.save();
+      return this.data.certifications[idx];
+    }
+    return null;
+  }
+
+  async getCompetencyRequirements(): Promise<CompetencyRequirement[]> {
+    if (this.mongoDb) return await this.mongoDb.collection<CompetencyRequirement>('competencyRequirements').find({}).toArray();
+    return this.data?.competencyRequirements || [];
+  }
+
+  /** Most recent conceptMastery for a student, from their latest EvaluationReport. */
+  async getLatestConceptMastery(studentId: string): Promise<Record<string, MasteryLevel> | null> {
+    const reports = this.mongoDb
+      ? await this.mongoDb.collection<EvaluationReport>('evaluationReports').find({ studentId }).sort({ timestamp: -1 }).limit(1).toArray()
+      : (this.data?.evaluationReports || []).filter(r => r.studentId === studentId).sort((a, b) => b.timestamp.localeCompare(a.timestamp)).slice(0, 1);
+    if (reports.length === 0) return null;
+    return reports[0].conceptMastery;
   }
 
   async getEvaluationReportById(id: string) {
@@ -1918,12 +1839,28 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
   }
 
   async addTicket(t: Ticket) {
+    if (!this.mongoDb) {
+      if (this.data) {
+        this.data.tickets.push(t);
+        await this.save();
+      }
+      return t;
+    }
     await this.mongoDb!.collection('tickets').insertOne(t);
     if (this.data) this.data.tickets.push(t);
     return t;
   }
 
   async updateTicket(id: string, updates: Partial<Ticket>) {
+    if (!this.mongoDb) {
+      const list = this.data?.tickets;
+      if (!list) return undefined;
+      const idx = list.findIndex(x => x.id === id);
+      if (idx === -1) return undefined;
+      list[idx] = { ...list[idx], ...updates };
+      await this.save();
+      return list[idx];
+    }
     await this.mongoDb!.collection('tickets').updateOne({ id }, { $set: updates });
     const t = await this.mongoDb!.collection<Ticket>('tickets').findOne({ id });
     if (t && this.data) {
@@ -1934,6 +1871,15 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
   }
 
   async updateUser(userId: string, updates: Partial<User>) {
+    if (!this.mongoDb) {
+      const list = this.data?.users;
+      if (!list) return undefined;
+      const idx = list.findIndex(x => x.id === userId);
+      if (idx === -1) return undefined;
+      list[idx] = { ...list[idx], ...updates };
+      await this.save();
+      return list[idx];
+    }
     await this.mongoDb!.collection('users').updateOne({ id: userId }, { $set: updates });
     const u = await this.mongoDb!.collection<User>('users').findOne({ id: userId });
     if (u && this.data) {
@@ -1944,6 +1890,15 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
   }
 
   async updateSchool(schoolId: string, updates: Partial<School>) {
+    if (!this.mongoDb) {
+      const list = this.data?.schools;
+      if (!list) return undefined;
+      const idx = list.findIndex(x => x.id === schoolId);
+      if (idx === -1) return undefined;
+      list[idx] = { ...list[idx], ...updates };
+      await this.save();
+      return list[idx];
+    }
     await this.mongoDb!.collection('schools').updateOne({ id: schoolId }, { $set: updates });
     const s = await this.mongoDb!.collection<School>('schools').findOne({ id: schoolId });
     if (s && this.data) {
@@ -1954,18 +1909,164 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
   }
 
   async addSchool(school: School) {
-    await this.mongoDb!.collection('schools').insertOne(school);
-    if (this.data) this.data.schools.push(school);
+    if (this.mongoDb) await this.mongoDb.collection('schools').insertOne(school);
+    if (this.data) {
+      this.data.schools.push(school);
+      if (!this.mongoDb) await this.save();
+    }
     return school;
   }
 
+  async deleteSchool(id: string): Promise<boolean> {
+    if (this.mongoDb) {
+      await this.mongoDb.collection('schools').deleteOne({ id });
+    }
+    if (this.data) {
+      const idx = this.data.schools.findIndex(s => s.id === id);
+      if (idx !== -1) {
+        this.data.schools.splice(idx, 1);
+        if (!this.mongoDb) await this.save();
+      }
+    }
+    return true;
+  }
+
+  async deleteUser(id: string): Promise<boolean> {
+    if (this.mongoDb) {
+      await this.mongoDb.collection('users').deleteOne({ id });
+    }
+    if (this.data) {
+      const idx = this.data.users.findIndex(u => u.id === id);
+      if (idx !== -1) {
+        this.data.users.splice(idx, 1);
+        if (!this.mongoDb) await this.save();
+      }
+    }
+    return true;
+  }
+
+  async deleteClassesForSchool(schoolId: string): Promise<number> {
+    if (this.mongoDb) {
+      await this.mongoDb.collection('classes').deleteMany({ schoolId });
+    }
+    if (this.data) {
+      const initialLen = this.data.classes.length;
+      this.data.classes = this.data.classes.filter(c => c.schoolId !== schoolId);
+      if (!this.mongoDb && this.data.classes.length !== initialLen) await this.save();
+    }
+    return 0;
+  }
+
   async addLog(log: LogEntry) {
-    await this.mongoDb!.collection('logbook').insertOne(log);
-    if (this.data) this.data.logbook.unshift(log);
+    // Phase 2 hardening fix: guard the Mongo write like addStudent() does.
+    // Previously `this.mongoDb!` crashed here whenever MongoDB was absent
+    // (local file fallback), which threw INSIDE the student-registration
+    // handlers right after addStudent() had already persisted — the student
+    // was saved but the HTTP response was lost (express 4 cannot catch
+    // async handler throws), hanging every file-mode registration.
+    if (this.mongoDb) {
+      await this.mongoDb.collection('logbook').insertOne(log);
+    }
+    if (this.data) {
+      this.data.logbook.unshift(log);
+      if (!this.mongoDb) await this.save();
+    }
     return log;
   }
 
+  /**
+   * Transactional sibling of {@link addLog}. Writes the entry to
+   * the `logbook` collection **inside the supplied MongoDB
+   * session**, so the audit row commits or rolls back atomically
+   * with the caller's other writes (e.g. the `vault_identities`
+   * and `vault_tokens` inserts in the tokenize command).
+   *
+   * **Why this exists.** Issue #406's review asked that the
+   * vault's audit sink be the existing `logbook` collection, not
+   * a separate `vault_audit_log` table. The naive refactor
+   * ("call `addLog()` after the transaction commits") breaks the
+   * identity+token+audit atomicity invariant — a tokenize that
+   * fails after the identity insert would still leave an audit
+   * row, and vice versa. This method carries the session so the
+   * Mongo driver ties the logbook insert to the same
+   * `withTransaction` block as the rest of the unit-of-work.
+   *
+   * **File-fallback path.** The `data.logbook` array is also
+   * updated best-effort. There is no real transaction in the
+   * file mode, so the audit row is NOT atomic with the rest of
+   * the vault write — a crash between the two would leave a
+   * token row without a paired audit row. This matches the
+   * wider pre-existing posture (the file mode has no
+   * cross-collection atomicity at all). Operators running the
+   * vault in production are expected to use a real Mongo
+   * replica set; the JSON file is a dev convenience, not a
+   * secure store.
+   */
+  async addLogInSession(session: ClientSession, log: LogEntry): Promise<LogEntry> {
+    if (this.mongoDb) {
+      await this.mongoDb.collection('logbook').insertOne(log, { session });
+    }
+    if (this.data) {
+      this.data.logbook.unshift(log);
+      if (!this.mongoDb) await this.save();
+    }
+    return log;
+  }
+
+  /**
+   * Read-side counterpart of {@link addLog}. Returns logbook rows
+   * whose `details` field starts with the given prefix, sorted
+   * newest-first, capped at `opts.limit` (default 100, max 1000).
+   *
+   * Used by the vault's read-audit-history command to filter
+   * the `logbook` collection down to vault audit rows (the
+   * `details` prefix is `vault:`, set by the mapping helper at
+   * `backend/src/modules/vault/audit/logbook-entry.ts`).
+   *
+   * The query is a prefix match, not an exact match: the
+   * `details` string is `vault:<action> identity=<id> ...`, so
+   * the same `vault:` prefix covers every vault row regardless
+   * of action. Callers that need to filter further (e.g. by
+   * identityId) do so in application code, parsing the `details`
+   * field — see `parseVaultLogbookEntry` in the audit-log
+   * helper.
+   *
+   * Regex special characters in the prefix are escaped so a
+   * caller passing arbitrary text cannot inject a regex
+   * pattern. The file-fallback path does a plain
+   * `String.prototype.startsWith` check.
+   */
+  async listLogsByDetailsPrefix(
+    prefix: string,
+    opts: { limit?: number } = {},
+  ): Promise<LogEntry[]> {
+    const limit = Math.max(1, Math.min(opts.limit ?? 100, 1000));
+    if (this.mongoDb) {
+      const escaped = prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      return await this.mongoDb
+        .collection<LogEntry>('logbook')
+        .find({ details: { $regex: '^' + escaped } })
+        .sort({ timestamp: -1 })
+        .limit(limit)
+        .toArray();
+    }
+    const rows = (this.data?.logbook ?? []).filter((l) =>
+      typeof l.details === 'string' && l.details.startsWith(prefix),
+    );
+    rows.sort((a, b) =>
+      a.timestamp < b.timestamp ? 1 : a.timestamp > b.timestamp ? -1 : 0,
+    );
+    return rows.slice(0, limit);
+  }
+
   async addAnnouncement(ann: Announcement) {
+    if (!this.mongoDb) {
+      if (this.data) {
+        this.data.announcements.unshift(ann);
+        await this.save();
+      }
+      return ann;
+    }
     await this.mongoDb!.collection('announcements').insertOne(ann);
     if (this.data) this.data.announcements.unshift(ann);
     return ann;
@@ -1974,16 +2075,33 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
   // --- Intervention & Best Practice Methods ---
 
   async getInterventions() {
+    if (!this.mongoDb) return this.data?.interventions || [];
     return await this.mongoDb!.collection<Intervention>('interventions').find({}).toArray();
   }
 
   async addIntervention(intervention: Intervention) {
+    if (!this.mongoDb) {
+      if (this.data) {
+        this.data.interventions.push(intervention);
+        await this.save();
+      }
+      return intervention;
+    }
     await this.mongoDb!.collection('interventions').insertOne(intervention);
     if (this.data) this.data.interventions.push(intervention);
     return intervention;
   }
 
   async updateIntervention(id: string, updates: Partial<Intervention>) {
+    if (!this.mongoDb) {
+      const list = this.data?.interventions;
+      if (!list) return undefined;
+      const idx = list.findIndex(x => x.id === id);
+      if (idx === -1) return undefined;
+      list[idx] = { ...list[idx], ...updates };
+      await this.save();
+      return list[idx];
+    }
     await this.mongoDb!.collection('interventions').updateOne({ id }, { $set: updates });
     const i = await this.mongoDb!.collection<Intervention>('interventions').findOne({ id });
     if (i && this.data) {
@@ -1994,16 +2112,33 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
   }
 
   async getBestPractices() {
+    if (!this.mongoDb) return this.data?.bestPractices || [];
     return await this.mongoDb!.collection<BestPractice>('bestPractices').find({}).toArray();
   }
 
   async addBestPractice(bp: BestPractice) {
+    if (!this.mongoDb) {
+      if (this.data) {
+        this.data.bestPractices.push(bp);
+        await this.save();
+      }
+      return bp;
+    }
     await this.mongoDb!.collection('bestPractices').insertOne(bp);
     if (this.data) this.data.bestPractices.push(bp);
     return bp;
   }
 
   async updateBestPractice(id: string, updates: Partial<BestPractice>) {
+    if (!this.mongoDb) {
+      const list = this.data?.bestPractices;
+      if (!list) return undefined;
+      const idx = list.findIndex(x => x.id === id);
+      if (idx === -1) return undefined;
+      list[idx] = { ...list[idx], ...updates };
+      await this.save();
+      return list[idx];
+    }
     await this.mongoDb!.collection('bestPractices').updateOne({ id }, { $set: updates });
     const bp = await this.mongoDb!.collection<BestPractice>('bestPractices').findOne({ id });
     if (bp && this.data) {
@@ -2017,22 +2152,46 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
 
   /** Live logics only unless `includeDeleted`, since soft-deleted rows exist purely for audit. */
   async getQuestionLogics(includeDeleted = false) {
+    if (!this.mongoDb) {
+      // Mirrors the Mongo query below: `{ deletedAt: null }` matches a null
+      // OR missing field (hence `==`), sorted by createdAt descending.
+      return (this.data?.questionLogics || [])
+        .filter(l => includeDeleted || l.deletedAt == null)
+        .sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0));
+    }
     const filter = includeDeleted ? {} : { deletedAt: null };
     return await this.mongoDb!.collection<QuestionLogic>('questionLogics')
       .find(filter).sort({ createdAt: -1 }).toArray();
   }
 
   async getQuestionLogicById(id: string) {
+    if (!this.mongoDb) return this.data?.questionLogics.find(x => x.id === id) || undefined;
     return (await this.mongoDb!.collection<QuestionLogic>('questionLogics').findOne({ id })) || undefined;
   }
 
   async addQuestionLogic(logic: QuestionLogic) {
+    if (!this.mongoDb) {
+      if (this.data) {
+        this.data.questionLogics.push(logic);
+        await this.save();
+      }
+      return logic;
+    }
     await this.mongoDb!.collection('questionLogics').insertOne(logic);
     if (this.data) this.data.questionLogics.push(logic);
     return logic;
   }
 
   async updateQuestionLogic(id: string, updates: Partial<QuestionLogic>) {
+    if (!this.mongoDb) {
+      const list = this.data?.questionLogics;
+      if (!list) return undefined;
+      const idx = list.findIndex(x => x.id === id);
+      if (idx === -1) return undefined;
+      list[idx] = { ...list[idx], ...updates };
+      await this.save();
+      return list[idx];
+    }
     await this.mongoDb!.collection('questionLogics').updateOne({ id }, { $set: updates });
     const l = await this.mongoDb!.collection<QuestionLogic>('questionLogics').findOne({ id });
     if (l && this.data) {
@@ -2047,6 +2206,14 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
    * rows — authoring five logics for one level still covers exactly one level.
    */
   async getQuestionLogicStats(totalLevels: number) {
+    if (!this.mongoDb) {
+      const live = (this.data?.questionLogics || []).filter(l => l.deletedAt == null);
+      return {
+        totalLogics: live.length,
+        totalLevels,
+        levelsWithLogic: new Set(live.map(l => l.level)).size,
+      };
+    }
     const live = await this.mongoDb!.collection<QuestionLogic>('questionLogics')
       .find({ deletedAt: null }).toArray();
     return {
@@ -2063,25 +2230,135 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
   // a reference that quietly stops meaning what it meant when it was written.
 
   async getQuestionTemplates(includeDeleted = false) {
+    if (!this.mongoDb) {
+      return (this.data?.questionTemplates || [])
+        .filter(t => includeDeleted || t.deletedAt == null)
+        .sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0));
+    }
     const filter = includeDeleted ? {} : { deletedAt: null };
     return await this.mongoDb!.collection<QuestionTemplate>('questionTemplates')
       .find(filter).sort({ createdAt: -1 }).toArray();
   }
 
   async getQuestionTemplateById(id: string) {
+    if (!this.mongoDb) return this.data?.questionTemplates.find(x => x.id === id) || undefined;
     return (await this.mongoDb!.collection<QuestionTemplate>('questionTemplates').findOne({ id })) || undefined;
+  }
+
+  /** Every live question assessing a given concept — the direct "what tests S3.4" lookup, index-backed. */
+  async getQuestionTemplatesByConcept(conceptId: string) {
+    if (!this.mongoDb) return (this.data?.questionTemplates || []).filter(t => t.conceptId === conceptId && t.deletedAt == null);
+    return await this.mongoDb!.collection<QuestionTemplate>('questionTemplates')
+      .find({ conceptId, deletedAt: null }).toArray();
+  }
+
+  /**
+   * Every live question that lists `skillId` in either its primary or
+   * supporting skills. This is the key-value lookup the schema exists for:
+   * `skills`/`subskills` are multikey-indexed, so "which questions test
+   * SK18 (Patterns)" is one indexed query, never a scan across every
+   * question x skill combination.
+   */
+  async getQuestionTemplatesBySkill(skillId: string) {
+    if (!this.mongoDb) return (this.data?.questionTemplates || []).filter(t => (t.skills || []).includes(skillId) && t.deletedAt == null);
+    return await this.mongoDb!.collection<QuestionTemplate>('questionTemplates')
+      .find({ skills: skillId, deletedAt: null }).toArray();
+  }
+
+  /** Same lookup at subskill granularity, e.g. "SK18.08" (Identify pattern rule). */
+  async getQuestionTemplatesBySubskill(subskillId: string) {
+    if (!this.mongoDb) return (this.data?.questionTemplates || []).filter(t => (t.subskills || []).includes(subskillId) && t.deletedAt == null);
+    return await this.mongoDb!.collection<QuestionTemplate>('questionTemplates')
+      .find({ subskills: subskillId, deletedAt: null }).toArray();
   }
 
   /** Live templates sharing a variant fingerprint. Drives the duplicate warning. */
   async getQuestionTemplatesByVariantKey(variantKey: string) {
+    if (!this.mongoDb) return (this.data?.questionTemplates || []).filter(t => t.variantKey === variantKey && t.deletedAt == null);
     return await this.mongoDb!.collection<QuestionTemplate>('questionTemplates')
       .find({ variantKey, deletedAt: null }).toArray();
   }
 
   async addQuestionTemplate(template: QuestionTemplate) {
+    if (!this.mongoDb) {
+      if (this.data) {
+        this.data.questionTemplates.push(template);
+        await this.save();
+      }
+      return template;
+    }
     await this.mongoDb!.collection('questionTemplates').insertOne(template);
     if (this.data) this.data.questionTemplates.push(template);
     return template;
+  }
+
+  // --- Teacher Observation Record Methods --------------------------------
+  // See TeacherObservationRecord's own comment for why this is a separate
+  // collection from answerSubmissions/questionTemplates. Addressed by
+  // (studentId, conceptId, cycle) -- the unique index this file's init
+  // sequence creates on that triple is what makes `upsert` below safe as a
+  // real upsert rather than a document-growing append.
+
+  /** One student's ratings across every observed concept, for one cycle. */
+  async getObservationRecordsForStudent(studentId: string, cycle: string) {
+    if (!this.mongoDb) return (this.data?.teacherObservationRecords || []).filter(r => r.studentId === studentId && r.cycle === cycle);
+    return await this.mongoDb!.collection<TeacherObservationRecord>('teacher_observation_records')
+      .find({ studentId, cycle }).toArray();
+  }
+
+  /** A whole class's ratings on one concept, for one cycle -- the class-grid sheet's read path. */
+  async getObservationRecordsForClass(classId: string, cycle: string) {
+    if (!this.mongoDb) return (this.data?.teacherObservationRecords || []).filter(r => r.classId === classId && r.cycle === cycle);
+    return await this.mongoDb!.collection<TeacherObservationRecord>('teacher_observation_records')
+      .find({ classId, cycle }).toArray();
+  }
+
+  /**
+   * Record or update one teacher's rating. Upsert on (studentId, conceptId,
+   * cycle) so re-submitting the same class-grid sheet corrects a rating
+   * rather than duplicating it.
+   */
+  async upsertObservationRecord(record: TeacherObservationRecord) {
+    if (!this.mongoDb) {
+      if (this.data) {
+        const list = this.data.teacherObservationRecords;
+        const idx = list.findIndex(x => x.studentId === record.studentId && x.conceptId === record.conceptId && x.cycle === record.cycle);
+        if (idx === -1) list.push(record);
+        else list[idx] = { ...list[idx], ...record };
+        await this.save();
+      }
+      return record;
+    }
+    await this.mongoDb!.collection<TeacherObservationRecord>('teacher_observation_records').updateOne(
+      { studentId: record.studentId, conceptId: record.conceptId, cycle: record.cycle },
+      { $set: record },
+      { upsert: true }
+    );
+    return record;
+  }
+
+  // --- Attempt Record Methods (Evidence Model, #479) ----------------------
+  // See AttemptRecord's own comment for what this captures and why it's a
+  // separate collection from answerSubmissions.
+
+  /** Every attempt one student has made; richest-evidence-first filtering/sorting is left to callers. */
+  async getAttemptRecordsForStudent(studentId: string): Promise<AttemptRecord[]> {
+    if (!this.mongoDb) return (this.data?.attemptRecords || []).filter(a => a.studentId === studentId);
+    return await this.mongoDb!.collection<AttemptRecord>('attempt_records').find({ studentId }).toArray();
+  }
+
+  /** Append-only -- an attempt is a historical fact, not something a later attempt should overwrite. */
+  async addAttemptRecord(record: AttemptRecord): Promise<AttemptRecord> {
+    if (!this.mongoDb) {
+      if (this.data) {
+        if (!this.data.attemptRecords) this.data.attemptRecords = [];
+        this.data.attemptRecords.push(record);
+        await this.save();
+      }
+      return record;
+    }
+    await this.mongoDb!.collection('attempt_records').insertOne(record);
+    return record;
   }
 
   /**
@@ -2093,12 +2370,28 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
    */
   async addQuestionTemplates(templates: QuestionTemplate[]) {
     if (templates.length === 0) return [];
+    if (!this.mongoDb) {
+      if (this.data) {
+        this.data.questionTemplates.push(...templates);
+        await this.save();
+      }
+      return templates;
+    }
     await this.mongoDb!.collection('questionTemplates').insertMany(templates as any[]);
     if (this.data) this.data.questionTemplates.push(...templates);
     return templates;
   }
 
   async updateQuestionTemplate(id: string, updates: Partial<QuestionTemplate>) {
+    if (!this.mongoDb) {
+      const list = this.data?.questionTemplates;
+      if (!list) return undefined;
+      const idx = list.findIndex(x => x.id === id);
+      if (idx === -1) return undefined;
+      list[idx] = { ...list[idx], ...updates };
+      await this.save();
+      return list[idx];
+    }
     await this.mongoDb!.collection('questionTemplates').updateOne({ id }, { $set: updates });
     const t = await this.mongoDb!.collection<QuestionTemplate>('questionTemplates').findOne({ id });
     if (t && this.data) {
@@ -2115,28 +2408,52 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
   // Superadmin adds a value matters more than saving a small query.
 
   async getQuestionOptions(includeInactive = false) {
+    if (!this.mongoDb) {
+      // Mirrors `.find(filter).sort({ type: 1, key: 1 })` below.
+      return (this.data?.questionOptions || [])
+        .filter(o => includeInactive || o.active === true)
+        .sort((a, b) => (a.type !== b.type ? (a.type < b.type ? -1 : 1) : a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+    }
     const filter = includeInactive ? {} : { active: true };
     return await this.mongoDb!.collection<QuestionOption>('questionOptions')
       .find(filter).sort({ type: 1, key: 1 }).toArray();
   }
 
   async getQuestionOptionById(id: string) {
+    if (!this.mongoDb) return this.data?.questionOptions.find(x => x.id === id) || undefined;
     return (await this.mongoDb!.collection<QuestionOption>('questionOptions').findOne({ id })) || undefined;
   }
 
   /** Active row with this (type, key), if any. Used to reject duplicate keys. */
   async getQuestionOptionByKey(type: QuestionOption['type'], key: string) {
+    if (!this.mongoDb) return this.data?.questionOptions.find(o => o.type === type && o.key === key && o.active === true) || undefined;
     return (await this.mongoDb!.collection<QuestionOption>('questionOptions')
       .findOne({ type, key, active: true })) || undefined;
   }
 
   async addQuestionOption(option: QuestionOption) {
+    if (!this.mongoDb) {
+      if (this.data) {
+        this.data.questionOptions.push(option);
+        await this.save();
+      }
+      return option;
+    }
     await this.mongoDb!.collection('questionOptions').insertOne(option);
     if (this.data) this.data.questionOptions.push(option);
     return option;
   }
 
   async updateQuestionOption(id: string, updates: Partial<QuestionOption>) {
+    if (!this.mongoDb) {
+      const list = this.data?.questionOptions;
+      if (!list) return undefined;
+      const idx = list.findIndex(x => x.id === id);
+      if (idx === -1) return undefined;
+      list[idx] = { ...list[idx], ...updates };
+      await this.save();
+      return list[idx];
+    }
     await this.mongoDb!.collection('questionOptions').updateOne({ id }, { $set: updates });
     const o = await this.mongoDb!.collection<QuestionOption>('questionOptions').findOne({ id });
     if (o && this.data) {
@@ -2147,6 +2464,15 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
   }
 
   async getQuestionTemplateStats(totalLevels: number) {
+    if (!this.mongoDb) {
+      const live = (this.data?.questionTemplates || []).filter(t => t.deletedAt == null);
+      return {
+        totalTemplates: live.length,
+        totalLevels,
+        levelsWithTemplate: new Set(live.map(t => t.conceptId)).size,
+        distinctVariants: new Set(live.map(t => t.variantKey)).size,
+      };
+    }
     const live = await this.mongoDb!.collection<QuestionTemplate>('questionTemplates')
       .find({ deletedAt: null }).toArray();
     return {
@@ -2179,6 +2505,22 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
     limit?: number;
     skip?: number;
   } = {}) {
+    if (!this.mongoDb) {
+      let items = (this.data?.questionBank || []).slice();
+      if (opts.level !== undefined) items = items.filter(e => e.level === opts.level);
+      if (opts.sectionType) items = items.filter(e => e.sectionType === opts.sectionType);
+      if (opts.status) items = items.filter(e => e.reviewStatus === opts.status);
+      if (opts.mappedLevel !== undefined) items = items.filter(e => e.mappedLevel === opts.mappedLevel);
+      const total = items.length;
+      items.sort((a, b) => {
+        if (a.level !== b.level) return a.level - b.level;
+        if (a.section !== b.section) return (a.section < b.section ? -1 : 1);
+        return a.questionNumber - b.questionNumber;
+      });
+      const skip = opts.skip || 0;
+      const limit = opts.limit || 50;
+      return { items: items.slice(skip, skip + limit), total };
+    }
     const filter: any = {};
     if (opts.level !== undefined) filter.level = opts.level;
     if (opts.sectionType) filter.sectionType = opts.sectionType;
@@ -2194,6 +2536,9 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
   }
 
   async getQuestionBankEntry(questionId: string) {
+    if (!this.mongoDb) {
+      return (this.data?.questionBank || []).find(e => e.questionId === questionId);
+    }
     return (await this.mongoDb!.collection<QuestionBankEntry>('questionBank')
       .findOne({ questionId })) || undefined;
   }
@@ -2206,6 +2551,14 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
     reviewedBy: string;
     reviewNote?: string;
   }) {
+    if (!this.mongoDb) {
+      const entry = (this.data?.questionBank || []).find(e => e.questionId === questionId);
+      if (entry) {
+        Object.assign(entry, patch, { reviewedAt: new Date().toISOString() });
+        await this.save();
+      }
+      return entry;
+    }
     const coll = this.mongoDb!.collection<QuestionBankEntry>('questionBank');
     await coll.updateOne({ questionId }, {
       $set: { ...patch, reviewedAt: new Date().toISOString() } as any,
@@ -2220,6 +2573,22 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
     reviewStatus: 'untagged' | 'mapped' | 'retired';
     reviewedBy: string;
   }) {
+    if (!this.mongoDb) {
+      const list = (this.data?.questionBank || []).filter(e => {
+        if (e.level !== filter.level) return false;
+        if (filter.section && e.section !== filter.section) return false;
+        if (filter.sectionType && e.sectionType !== filter.sectionType) return false;
+        return true;
+      });
+      const now = new Date().toISOString();
+      for (const entry of list) {
+        Object.assign(entry, patch, { reviewedAt: now });
+      }
+      if (list.length > 0) {
+        await this.save();
+      }
+      return { matched: list.length, modified: list.length };
+    }
     const q: any = { level: filter.level };
     if (filter.section) q.section = filter.section;
     if (filter.sectionType) q.sectionType = filter.sectionType;
@@ -2237,6 +2606,39 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
    * mapped level-to-level instead.
    */
   async getQuestionBankProgress() {
+    if (!this.mongoDb) {
+      const list = this.data?.questionBank || [];
+      const total = list.length;
+      const mapped = list.filter(e => e.reviewStatus === 'mapped').length;
+      const retired = list.filter(e => e.reviewStatus === 'retired').length;
+      const untagged = list.filter(e => e.reviewStatus === 'untagged').length;
+      const levels = Array.from(new Set(list.map(e => e.level))).sort((a, b) => a - b);
+      const targetLevelsCovered = Array.from(new Set(
+        list
+          .filter(e => e.reviewStatus === 'mapped' && typeof e.mappedLevel === 'number')
+          .map(e => e.mappedLevel as number)
+      )).sort((a, b) => a - b);
+      const byLevelMap = new Map<number, { total: number; mapped: number; retired: number }>();
+      for (const e of list) {
+        let stat = byLevelMap.get(e.level);
+        if (!stat) {
+          stat = { total: 0, mapped: 0, retired: 0 };
+          byLevelMap.set(e.level, stat);
+        }
+        stat.total++;
+        if (e.reviewStatus === 'mapped') stat.mapped++;
+        if (e.reviewStatus === 'retired') stat.retired++;
+      }
+      const byLevel = Array.from(byLevelMap.entries())
+        .sort((a, b) => a[0] - b[0])
+        .map(([level, stats]) => ({ level, ...stats }));
+      return {
+        total, mapped, retired, untagged,
+        legacyLevelsInBank: levels,
+        targetLevelsCovered,
+        byLevel,
+      };
+    }
     const coll = this.mongoDb!.collection<QuestionBankEntry>('questionBank');
     const [total, mapped, retired, untagged, levels, targets] = await Promise.all([
       coll.countDocuments({}),
@@ -2264,17 +2666,26 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
   }
 
   async getCurriculumLevels() {
+    if (!this.mongoDb) {
+      return [...(this.data?.curriculumLevels || [])].sort((a, b) => a.levelNumber - b.levelNumber);
+    }
     return await this.mongoDb!.collection<CurriculumLevel>('curriculumLevels')
       .find({}).sort({ levelNumber: 1 }).toArray();
   }
 
   async getCurriculumLevel(levelNumber: number) {
+    if (!this.mongoDb) {
+      return (this.data?.curriculumLevels || []).find(l => l.levelNumber === levelNumber);
+    }
     return (await this.mongoDb!.collection<CurriculumLevel>('curriculumLevels')
       .findOne({ levelNumber })) || undefined;
   }
 
   /** Look a level up by its permanent identity rather than by its position. */
   async getCurriculumLevelByConceptId(conceptId: string) {
+    if (!this.mongoDb) {
+      return (this.data?.curriculumLevels || []).find(l => l.conceptId === conceptId);
+    }
     return (await this.mongoDb!.collection<CurriculumLevel>('curriculumLevels')
       .findOne({ conceptId })) || undefined;
   }
@@ -2287,6 +2698,9 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
    * the last such call site is gone, this method and `legacyLevel59` go with it.
    */
   async getCurriculumLevelByLegacy59(legacyLevel59: number) {
+    if (!this.mongoDb) {
+      return (this.data?.curriculumLevels || []).find(l => l.legacyLevel59 === legacyLevel59);
+    }
     return (await this.mongoDb!.collection<CurriculumLevel>('curriculumLevels')
       .findOne({ legacyLevel59 })) || undefined;
   }
@@ -2299,6 +2713,23 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
    * landed.
    */
   async setCurriculumLegacyMapping(levelNumber: number | null, legacyLevel59: number) {
+    if (!this.mongoDb) {
+      const list = this.data?.curriculumLevels || [];
+      for (const l of list) {
+        if (l.legacyLevel59 === legacyLevel59) {
+          l.legacyLevel59 = null;
+        }
+      }
+      if (levelNumber !== null) {
+        const target = list.find(l => l.levelNumber === levelNumber);
+        if (target) {
+          target.legacyLevel59 = legacyLevel59;
+          target.updatedAt = new Date().toISOString();
+        }
+      }
+      await this.save();
+      return;
+    }
     const coll = this.mongoDb!.collection<CurriculumLevel>('curriculumLevels');
     // Only one 93-space level may claim a given legacy id.
     await coll.updateMany({ legacyLevel59 }, { $set: { legacyLevel59: null } });
@@ -2319,6 +2750,88 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
       withAnyContent: levels.filter(l => l.hasStaticHtml || l.hasBuilder).length,
       mappedFromLegacy59: levels.filter(l => l.legacyLevel59 !== null).length,
     };
+  }
+
+  // --- D1.6 Skill Evolution: Candidate Skills & Skills Methods (#481) ---
+
+  async addCandidateSkill(candidate: CandidateSkill): Promise<CandidateSkill> {
+    if (this.mongoDb) {
+      await this.mongoDb.collection<CandidateSkill>('candidate_skills').insertOne(candidate);
+    }
+    if (this.data) {
+      if (!this.data.candidateSkills) this.data.candidateSkills = [];
+      this.data.candidateSkills.push(candidate);
+      if (!this.mongoDb) await this.save();
+    }
+    return candidate;
+  }
+
+  async getCandidateSkills(filter?: { status?: CandidateSkillStatus; parentSkillId?: string }): Promise<CandidateSkill[]> {
+    if (this.mongoDb) {
+      const q: any = {};
+      if (filter?.status) q.status = filter.status;
+      if (filter?.parentSkillId) q.parentSkillId = filter.parentSkillId;
+      return await this.mongoDb.collection<CandidateSkill>('candidate_skills').find(q).sort({ createdAt: -1 }).toArray();
+    }
+    let list = this.data?.candidateSkills || [];
+    if (filter?.status) list = list.filter(c => c.status === filter.status);
+    if (filter?.parentSkillId) list = list.filter(c => c.parentSkillId === filter.parentSkillId);
+    return list;
+  }
+
+  async getCandidateSkillById(id: string): Promise<CandidateSkill | undefined> {
+    if (this.mongoDb) {
+      return (await this.mongoDb.collection<CandidateSkill>('candidate_skills').findOne({ id })) || undefined;
+    }
+    return (this.data?.candidateSkills || []).find(c => c.id === id);
+  }
+
+  async updateCandidateSkill(id: string, updates: Partial<CandidateSkill>): Promise<CandidateSkill | undefined> {
+    const updatedAt = new Date().toISOString();
+    const finalUpdates = { ...updates, updatedAt };
+    if (this.mongoDb) {
+      await this.mongoDb.collection<CandidateSkill>('candidate_skills').updateOne({ id }, { $set: finalUpdates });
+      return (await this.mongoDb.collection<CandidateSkill>('candidate_skills').findOne({ id })) || undefined;
+    }
+    const idx = (this.data?.candidateSkills || []).findIndex(c => c.id === id);
+    if (idx !== -1 && this.data) {
+      this.data.candidateSkills[idx] = { ...this.data.candidateSkills[idx], ...finalUpdates };
+      if (!this.mongoDb) await this.save();
+      return this.data.candidateSkills[idx];
+    }
+    return undefined;
+  }
+
+  async addSkill(skill: Skill): Promise<Skill> {
+    if (this.mongoDb) {
+      await this.mongoDb.collection<Skill>('skills').insertOne(skill);
+    }
+    if (this.data) {
+      if (!this.data.skills) this.data.skills = [];
+      this.data.skills.push(skill);
+      if (!this.mongoDb) await this.save();
+    }
+    return skill;
+  }
+
+  async getSkills(filter?: { parentSkillId?: string; validationStatus?: SkillValidationStatus }): Promise<Skill[]> {
+    if (this.mongoDb) {
+      const q: any = {};
+      if (filter?.parentSkillId) q.parentSkillId = filter.parentSkillId;
+      if (filter?.validationStatus) q.validationStatus = filter.validationStatus;
+      return await this.mongoDb.collection<Skill>('skills').find(q).sort({ id: 1 }).toArray();
+    }
+    let list = this.data?.skills || [];
+    if (filter?.parentSkillId) list = list.filter(s => s.parentSkillId === filter.parentSkillId);
+    if (filter?.validationStatus) list = list.filter(s => s.validationStatus === filter.validationStatus);
+    return list;
+  }
+
+  async getSkillById(id: string): Promise<Skill | undefined> {
+    if (this.mongoDb) {
+      return (await this.mongoDb.collection<Skill>('skills').findOne({ id })) || undefined;
+    }
+    return (this.data?.skills || []).find(s => s.id === id);
   }
 
   // --- Diagnostic Answer Key Methods ---
@@ -4237,6 +4750,8 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
       interventions,
       bestPractices,
       diagnosticAnswerKeys: [],
+      certifications: [],
+      competencyRequirements: getSeedCompetencyRequirements(),
       misconceptionClusters: [],
       testHistory: [],
       // Seeded empty on purpose: question logics are pedagogy authored by a real
@@ -4244,11 +4759,23 @@ const COLLECTION_NAMES: Record<keyof DatabaseSchema, string> = {
       // intent in front of the question-generation pipeline.
       questionLogics: [],
       questionTemplates: [],
-      questionOptions: [],
+            questionOptions: [],
       // Populated by `npm run seed:levels`, not by the demo seed — the
       // curriculum is real data with one source, not fixture content.
       curriculumLevels: [],
-      studentCycleLocks: []
+      studentCycleLocks: [],
+
+      generationWindows: [],
+      // Seeded empty on purpose, same reasoning as questionLogics above: a
+      // teacher's observation of a real child is not something to fabricate
+      // demo data for.
+      teacherObservationRecords: [],
+      // Same reasoning again -- a child's actual hints/scaffolding evidence
+      // isn't something to fabricate demo data for either.
+      attemptRecords: [],
+      // D1.6 Candidate skills and discovered skills (#481)
+      candidateSkills: [],
+      skills: []
     };
   }
 }

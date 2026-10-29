@@ -1,17 +1,58 @@
 import { Question } from './db';
 import { QuestionService } from './services/questionService';
 import { CURRICULUM_MAPPING } from './config/curriculumMap';
+import { generateQuestionsFromTemplates } from './services/questionTemplateRenderer';
+
+/** Questions a generated paper carries per level. The legacy builder below builds the same count. */
+export const QUESTIONS_PER_LEVEL = 4;
+
+/**
+ * Balvatika is levels 19-46 (stage 3 plus S4.12, S4.13, S5.9, S5.13). A Balvatika
+ * level is assessed with 5 questions: the curriculum reviewer's ruling on the
+ * Balvatika question bank (2026-10-22) is "5 is enough for each concept", scored
+ * 0-1 Beginner, 2-3 Intermediate, 4-5 Proficient. (#594's earlier 8-10 is superseded.)
+ */
+export const BALVATIKA_FIRST_LEVEL = 19;
+export const BALVATIKA_LAST_LEVEL = 46;
+export const QUESTIONS_PER_BALVATIKA_LEVEL = 5;
+
+/** How many questions a paper for `level` carries. */
+export function questionsPerLevel(level: number): number {
+  return level >= BALVATIKA_FIRST_LEVEL && level <= BALVATIKA_LAST_LEVEL
+    ? QUESTIONS_PER_BALVATIKA_LEVEL
+    : QUESTIONS_PER_LEVEL;
+}
 
 // Helper to generate a random integer
 function randomVal(min: number, max: number): number {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
-// Programmatic math builder for all 93 levels and 3 sub-levels
-export function generateQuestionsForLevel(level: number, subLevel: number): Question[] {
+// Programmatic math builder — fallback for any level not in CURRICULUM_MAPPING (all
+// current levels are mapped, so this switch is legacy/dead code for the live registry;
+// see the CURRICULUM_MAPPING[level] short-circuit below).
+//
+// Async since issue #486: a level's approved `questionTemplates` are queried
+// first, and only when a concept has none does generation fall back to the
+// hand-written sources beneath it.
+export async function generateQuestionsForLevel(level: number, subLevel: number): Promise<Question[]> {
   // If the level is mapped in our concept registry, use concept-driven generation
-  if (CURRICULUM_MAPPING[level]) {
-    return QuestionService.getQuestionsByLevel(level, subLevel);
+  const conceptConfig = CURRICULUM_MAPPING[level];
+  if (conceptConfig) {
+    // Template-first: the intent-based authoring model is the source of truth
+    // for a concept somebody has actually authored for. `generateQuestionsFromTemplates`
+    // returns [] for a concept with no approved templates (or an unreadable
+    // store), which is exactly the "not authored yet" case the legacy
+    // generator still has to cover.
+    const count = questionsPerLevel(level);
+    const fromTemplates = await generateQuestionsFromTemplates(conceptConfig.conceptId, {
+      count,
+      levelNumber: level,
+      subLevel,
+    });
+    if (fromTemplates.length > 0) return fromTemplates;
+
+    return QuestionService.getQuestionsByLevel(level, subLevel, count);
   }
 
   const questions: Question[] = [];

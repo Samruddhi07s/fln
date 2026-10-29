@@ -4,6 +4,69 @@ All notable changes to this repository, grouped by date (newest first).
 Auto-curated from git history: pull-request merges and direct commits are listed;
 routine branch-sync merges are omitted. Regenerate with `gen_changelog.py`.
 
+## 2026-10-12 — Balvatika pipeline, pilot-safety fixes and contributor onboarding
+
+Everything merged between 2026-10-04 and 2026-10-12.
+
+**Balvatika pipeline**
+- **`feat`: generate worksheet questions from approved question templates (#805)** — `generateQuestionsForLevel` now reads a concept's approved templates first and falls back to the old generators only when none exist; observation-only templates never print on a student paper. Continues the earlier #647.
+- **`fix`: Balvatika worksheet PDF layout (#794, @Ritwij07)** — question text wraps to the page, 18 pt print, 4 questions per page, answer box below the text.
+- **`fix`: paginate personalized worksheet PDF questions (#631, @Ashish-Galaxy07)**.
+- **`feat`: Balvatika stage helper (#629, @jiyasingh951s-arch)** and **per-concept mastery rating with the 2-of-3 rule (#732, @lucky-pluton)**.
+- **`feat`: stage-specific authoring ZIP (#709, @KulkarniVidya)**, **template download with reference CSVs (#652)** and a **50-asset printable SVG library (#653)**.
+- **`fix`: all 10 question families in the template panel (#804)**, **assessment mode in question templates (#667, #711, #714, #716)**.
+- **`feat`: AttemptRecord evidence schema (#654, @Swasti2004)** and **choice error tags (#648, #693, #644)**.
+
+**Level count (109) and generation windows**
+- **`fix`: replace the hardcoded level ceiling (#607, #801)** — progress bars, dropdowns, target level and the question-bank audit use `MAX_FLN_LEVEL`.
+- **`feat`: time-bound worksheet generation workflow (#93, @Chirashrikarmakar)** and its tidy-up **(#723)**.
+
+**Roles, schools and data safety**
+- **`fix`: school onboarding rolls back on failure and the principal is not made class teacher (#717)**; geography codes validated **(#710, #764)**; **superadmin school onboarding (#662)**.
+- **`fix`: observation concept IDs validated (#790)**; observation routes **(#642)**.
+- **`fix`: overrides now update the fingerprint, archetype and root causes (#673)**.
+- **`fix`: analytics no longer shows another school when the user has no school ID (#719)** and defensive principal scoping with loading and empty states **(#661)**.
+- **`fix`: report the real MongoDB connection state (#775) and remove the dead Atlas connect form (#773)**; file-store fallback instead of hanging **(#580)**; collection names and analytics counters corrected **(#582)**.
+- **`fix`: vault configuration documented and missing settings logged at startup (#798)**.
+
+**Tests and CI**
+- **`test`: createStudentFromData validation (#586)**; **CI check that tests the merged result (#680)**; smoke baseline update **(#686)**.
+
+**Onboarding documents merged:** #226, #576, #708.
+
+## 2026-10-03 — Repo Health Check & Level-Notation Alignment
+
+- **`fix(curriculum)`: synchronize 109-level L-to-S notation crosswalk (#554)** — updated `Research/fln_L_to_S_crosswalk.json` to cover all 109 levels (`L1`–`L109` mapped to `S1.1`–`S7.18`) matching `frontend/src/data/skillProgressionMap.ts` and `POSITION_TO_SCODE`, resolving drift reported by `npm run check:level-notation-drift`. Updated `scripts/check-level-notation-drift.ts` for Windows ESM URL compatibility using `pathToFileURL`.
+- **`fix(roster)`: resolve teacher roster pagination bug (#553)** — fixed out-of-bounds pagination clamping in `Table.tsx`, added `key` props to force table page reset on tab switch, and updated `usePanelData.ts` to request `/api/students?all=1` for all roles.
+- **`chore(changelog)`: refresh CHANGELOG.md for repo health compliance (#554)** — added dated entry capturing recent system fixes and curriculum updates.
+
+## 2026-09-16 — R-7 Certification Engine, pre-OCR scan-quality gate & Parikshak PR bots
+
+- **`feat(certification)`: SRS R-7 Certification Engine (#242)** — the certification pipeline landed end-to-end on the post-route-split backend: a pure eligibility engine (`backend/src/services/certificationEligibility.ts`) resolves a student to `eligible` / `not_eligible` / `insufficient_evidence` by ranking observed mastery (Strong > Satisfactory > Needs Practice) against the seeded mandatory competency requirements for the class (`backend/src/data/competencyRequirements.seed.json`, `backend/src/services/certificationCompetencyRequirements.ts`); `services/certificationRecords.ts` orchestrates recomputation per student (module-level promise chaining) and is triggered fire-and-forget from both `EvaluationReport` write paths (`backend/src/routes/evaluation.ts:1032`, `backend/src/routes/students.ts:1434`) so a certification recompute can never fail a worksheet submit; `services/certificationNotifications.ts` writes an in-app logbook entry and emails every SUPERADMIN/ADMIN user (nodemailer when `SMTP_HOST` is set, stdout payload otherwise); `backend/src/db.ts` gains the `certifications` / `competency_requirements` collections and their accessors (`getCertifications`, `getCertificationById`, `updateCertificationIfVersion` for optimistic `(id, version)` concurrency, `getLatestConceptMastery`); new routes `POST /api/certification/review/:certificationId` (confirm/revoke, revoke requires a reason, 409 on concurrent modification, `canAccessStudent` IDOR guard) and `GET /api/certifications` (admin queue vs per-student history); dependency-free assert scripts `backend/src/__checks__/certification.check.ts` and `certification-list.check.ts`; `backend/src/scripts/demo-cert.ts` walkthrough; UI — "Certification Reviews" sidebar entry for ADMIN/SUPERADMIN (`Layout.tsx`), review queue with a required-reason revoke modal (`CertificationReviewPanel.tsx`), per-student history card (`CertificationHistoryCard.tsx`), plus `Ideas/ONBOARDING-Sainikhil.md`.
+- **`feat(scan)`: pre-OCR scan-quality gate + UI quality feedback (#440)** — new dependency-free `backend/src/scanQuality.ts` inspects image headers (MIME type, resolution, orientation, file-size limits) before OCR is dispatched; `POST /api/icr/check-quality` exposes a pre-flight check, and `POST /api/icr/evaluate-cloud` now returns 400 on `reject` and 422 on `warning` unless the caller passes `proceedDespiteQualityWarning: true`, appending the `qualityResult` to the OCR response; optional `scanQuality` fields were added to `AnswerSubmission` / `EvaluationReport` so callers can persist the verdict; `backend/src/scanQuality.test.ts` covers 8 boundary cases (PNG/JPEG header parsing, 600×600 minimum, >25 MB file, unsupported MIME); `frontend/src/components/IcrTwoStageScan.tsx` surfaces the quality result with an override path. A follow-up commit narrowed the gate to resolution + orientation only and deferred pixel-level brightness/contrast/blur metrics to a later task. Also added `Ideas/ONBOARDING-Omar-Shaik.md`.
+- **`feat(assets)`: extract legacy question-bank SVGs out of MongoDB into files (#497)** — one-off `backend/src/extractQuestionBankSvgs.ts` wrote one `.svg` per question (1,202 files) plus `manifest.json` under `frontend/public/assets/svg/legacy-question-bank/`, escaping stray `<`, `>` and `&` in the 105 rows whose text was never escaped (invalid XML → valid XML, the other 1,097 verified byte-identical); `frontend/src/components/panels/QuestionReviewPanel.tsx` was repointed from inline `dangerouslySetInnerHTML` to lazy `<img>` lookups; `backend/src/migrations/cleanInlineSvgFromDb.ts` added as a dry-run-by-default report that unsets `questionBank.svgHtml` / `levelHtmlTemplates.htmlContent` only with `--apply`, and only after verifying the file replacements exist on disk. Closes the last gap in the "SVG markup lives in exactly one place" rule.
+- **`feat(skills)`: four missing micro-skills + prerequisite graph in version control (#501, #503)** — `frontend/src/data/skillProgressionMap.ts` gained the 4 micro-skills missed in the Pavani/Amritha tree review, and the micro-skill prerequisite graph (1,576-line HTML) plus the 2026-09-15 review findings were committed under `Research/micro-skill-graph/`.
+- **`feat(ci)`: PR gate check + Parikshak 48-hour stale-PR bot (#492, #493, #494)** — comment-only PR gate check (`.github/scripts/pr-gate-check.js` + `.github/workflows/pr-gate-check.yml`, deterministic checks only, `workflow_dispatch` for manual runs) and a 48-hour stale-PR auto-close job (`.github/scripts/parikshak-stale-check.js` + `.github/workflows/parikshak-stale-check.yml`), plus detailed per-check logging in the Actions run and a per-PR summary line on every stale-check run.
+- **`feat(dashboards)`: surface audit logbook + in-app ticketing (#72)** — Admin, Superadmin, School and Teacher dashboards gained entry points to the audit logbook and ticket views; `Ideas/ONBOARDING-ARYAN.md` added.
+- **`fix(school)`: principal dashboard + register-students panel (#462 closes #443, #472 closes #446)** — the principal/teacher dashboards now display the actual school name instead of a hardcoded/blank value, and the students panel is registered for the principal role (`frontend/src/components/PanelViews.tsx`).
+- **`fix(ui)`: dark mode for coordinator registration (#474)** — `frontend/src/pages/CoordinatorRegistration.tsx` class strings updated for dark-mode parity.
+- **`fix(frontend)`: partner logo on sub-path deployments (#488, closes #455)** — `LandingView.tsx` resolves the partner logo through `withBase()` instead of a root-absolute path.
+- **`fix(ci)`: unresolved `mergeable` status no longer means "no conflict" (#495)** — the stale-PR check used to silently treat an unresolved GitHub `mergeable` status as conflict-free.
+- **`refactor(backend)`: remove five dead OCR provider branches (#505, closes #485)** — 221 lines of unreachable provider branches deleted from `backend/src/routes/evaluation.ts`.
+- **`docs(curriculum)`: canonical curriculum terminology & ID mapping (#436, closes #348)** — new `docs/curriculum-terminology-and-id-mapping.md` (indexed in `docs/README.md`), replacing the legacy crosswalk table with the question-level concept-tagging architecture (#423).
+- **`docs`: README / CONTRIBUTING accuracy refresh (#491)** — refreshed for current scope, architecture and PR flow, and now states the modular / plug-and-play requirement explicitly.
+- **`docs(agents)`: `AGENTS.md` added and kept in sync with `CLAUDE.md` (#487, #507)** — `AGENTS.md` introduced as the Codex/Cursor/Windsurf mirror of `CLAUDE.md` and aligned with backend-structure ADR 001; `#507` corrected the stale claim that MongoDB was not the real primary store and re-synced both files.
+- **`docs(onboarding)`: contributor onboarding documents (#392, #440, #463, #162, #72)** — `Ideas/ONBOARDING-Ritwij-Tripathi.md`, `ONBOARDING-Omar-Shaik.md`, `ONBOARDING-Pushpendra-Sharma.md`, `ONBOARDING-S_Shrinidhi_Sharma.md` and `ONBOARDING-ARYAN.md`.
+- **`docs(research)`: foundational KST sources (#464)** — merged 2026-09-09 and not captured by that date's entry below: the two Falmagne KST PDFs plus `Research/KST_Falmagne_and_kst_package_notes.md`, with original source URLs cited.
+
+## 2026-09-09 — Diagnostics classification, placement cap & CI repo-health fixes
+
+- **`fix(ci)`: robust issue tracking in repo health check** — fixed workflow step where `jq '.[0].number'` evaluated to `"null"` when no issues existed, causing invalid issue operations, ensured label existence checks are resilient, and added Windows `pathToFileURL` compatibility in `scripts/check-level-notation-drift.ts`.
+- **`fix(diagnostics)`: classify wrong-answer error types and retire dead legacy-pipeline code (#460)** — classified diagnostic wrong answers and cleaned up obsolete pipeline logic.
+- **`fix(placement)`: cap level recommendations at 59, not 93 (#457)** — bounded diagnostic placement recommendations to the 59 valid active levels.
+- **`docs(schema)`: record decision on difficulty field (#454, #324)** — documented architecture decision and schema specifications for item difficulty.
+- **`docs(onboarding)`: add onboarding documents and task scoping** — added and updated team onboarding documents (#409, #432).
+
 ## 2026-09-02 — Per-student generation lock (cycle-based)
 
 - **`feat(backend)`: per-student generation-cycle lock helper** — new `backend/src/paperLock.ts` module + `paperLock.test.ts` (10 cases). A pure function that decides whether a teacher may re-generate a Diagnostic / Baseline / Mid-Year / End-Year paper for a given `(studentId, paperType, cycle)` triple. Remedial and Practice are explicitly NOT in the lock set — they remain unlimited per user requirement.

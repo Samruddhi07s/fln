@@ -8,14 +8,20 @@ import { User, Student, ClassGroup, DashboardProps } from '../../types';
 import { DiagnosticWorkflow } from '../DiagnosticWorkflow';
 import { BaselineUpload } from '../BaselineUpload';
 import { SkillGraphPanel } from '../SkillGraphPanel';
+import { LEVEL_SKILL_MAP } from '../../data/skillProgressionMap';
 import { Table, Column } from '../Table';
 import { LevelBadge } from '../RoleDashboards';
+import { DashboardSkeleton } from '../ui/DashboardSkeleton';
+import { RosterSkeleton } from '../ui/RosterSkeleton';
+import { EmptyStateCard } from '../ui/EmptyStateCard';
+import { School } from 'lucide-react';
 
 
 export const VolunteerDashboard: React.FC<DashboardProps> = ({ user, token }) => {
   const [classes, setClasses] = useState<ClassGroup[]>([]);
   const [students, setStudents] = useState<Student[]>([]);
   const [activeClass, setActiveClass] = useState<ClassGroup | null>(null);
+  const [dashboardLoading, setDashboardLoading] = useState(true);
 
   const [diagnosticStudent, setDiagnosticStudent] = useState<Student | null>(null);
   const [baselineStudent, setBaselineStudent] = useState<Student | null>(null);
@@ -54,6 +60,7 @@ export const VolunteerDashboard: React.FC<DashboardProps> = ({ user, token }) =>
   };
 
   const fetchVolunteerData = async () => {
+    setDashboardLoading(true);
     try {
       const clsRes = await apiFetch('/api/classes', { headers: { 'Authorization': `Bearer ${token}` } });
       const clsData = await clsRes.json();
@@ -67,6 +74,8 @@ export const VolunteerDashboard: React.FC<DashboardProps> = ({ user, token }) =>
       if (Array.isArray(stdData)) setStudents(stdData);
     } catch (err) {
       console.error(err);
+    } finally {
+      setDashboardLoading(false);
     }
   };
 
@@ -103,6 +112,15 @@ export const VolunteerDashboard: React.FC<DashboardProps> = ({ user, token }) =>
 
   const classStudents = activeClass ? students.filter(s => s.classGroup === activeClass.className && s.section === activeClass.section) : [];
 
+  if (dashboardLoading) {
+    return (
+      <div className="space-y-6" id="volunteer-dashboard">
+        <DashboardSkeleton metricCount={3} />
+        <RosterSkeleton columns={5} />
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-6" id="volunteer-dashboard">
       {levelPdfLoading && (
@@ -126,7 +144,7 @@ export const VolunteerDashboard: React.FC<DashboardProps> = ({ user, token }) =>
             onClick={() => setShowSkillGraph(true)}
             className="bg-white dark:bg-slate-900 hover:bg-zinc-50 dark:hover:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 text-zinc-700 dark:text-zinc-200 font-mono text-xs font-semibold px-4 py-2.5 rounded-lg transition-colors cursor-pointer"
           >
-            🧠 Skill Progression (93 levels)
+            🧠 Skill Progression ({LEVEL_SKILL_MAP.length} levels)
           </button>
 
         </div>
@@ -134,6 +152,16 @@ export const VolunteerDashboard: React.FC<DashboardProps> = ({ user, token }) =>
 
 
 
+      {classes.length === 0 && (
+        <EmptyStateCard
+          illustration={<School className="h-6 w-6" />}
+          title="No classrooms assigned"
+          description="There are no classrooms assigned to your volunteer account yet. Contact your coordinator if you expect an assignment."
+        />
+      )}
+
+      {classes.length > 0 && (
+        <>
       <div className="flex gap-2 border-b border-zinc-200 dark:border-zinc-700 pb-px">
         {classes.map(c => (
           <button
@@ -148,12 +176,12 @@ export const VolunteerDashboard: React.FC<DashboardProps> = ({ user, token }) =>
         ))}
       </div>
 
-      {activeClass && (
+      {activeClass && (classStudents.length > 0 ? (
         <div className="space-y-6">
           {/* Issue #166: Diagnostic Paper Generator + Level-Wise Paper Generator
               + Exam Worksheets Engine cards removed from this dashboard. They
               now live in:
-                - Assessment -> Diagnostic Test (BulkDiagnosticWorkflow + 93 FLN
+                - Assessment -> Diagnostic Test (BulkDiagnosticWorkflow + FLN
                   Framework modal — DiagnosticTestPanel.tsx)
                 - Worksheets (Level-Wise batch generator + Open Personalization
                   Portal + ICR Answer Sheet Scanner launchers — WorksheetsPanel.tsx)
@@ -168,18 +196,23 @@ export const VolunteerDashboard: React.FC<DashboardProps> = ({ user, token }) =>
             <div className="p-4">
               {(() => {
                 const studentColumns: Column<Student>[] = [
-                  { header: 'ID', accessor: (s) => s.displayId || s.id, sortKey: 'id', className: 'font-mono text-xs text-slate-400 dark:text-slate-500' },
+                  { header: 'ID', accessor: (s) => s.displayId || s.id, exportValue: (s) => s.displayId || s.id, sortKey: 'id', className: 'font-mono text-xs text-slate-400 dark:text-slate-500' },
                   { header: 'Student Name', accessor: 'name', sortKey: 'name', className: 'font-medium text-slate-900 dark:text-slate-100' },
                   {
                     header: 'Current Level',
-                    accessor: (s) => <LevelBadge level={s.currentLevel} subLevel={s.currentSubLevel} />
+                    accessor: (s) => <LevelBadge level={s.currentLevel} subLevel={s.currentSubLevel} />,
+                    exportValue: (s) => s.currentLevel ?? ''
                   },
                   {
                     header: 'Target Level',
-                    accessor: (s) => <span className="font-mono text-slate-500 dark:text-slate-400 text-xs">Level {s.targetLevel}</span>
+                    accessor: (s) => <span className="font-mono text-slate-500 dark:text-slate-400 text-xs">Level {s.targetLevel}</span>,
+                    exportValue: (s) => s.targetLevel != null ? `Level ${s.targetLevel}` : ''
                   },
                   {
                     header: 'Diagnostic Status',
+                    exportValue: (s) => s.levelHistory.length === 0
+                      ? 'Pending'
+                      : `${s.levelHistory[s.levelHistory.length - 1].reason} Done`,
                     accessor: (s) => s.levelHistory.length === 0 ? (
                       <div className="flex items-center gap-1.5">
                         <button
@@ -227,6 +260,14 @@ export const VolunteerDashboard: React.FC<DashboardProps> = ({ user, token }) =>
             </div>
           </div>
         </div>
+      ) : (
+        <EmptyStateCard
+          illustration={<School className="h-6 w-6" />}
+          title="No students in this classroom"
+          description="This classroom does not have any registered students yet. Choose another assigned classroom to continue."
+        />
+      ))}
+      </>
       )}
       <SkillGraphPanel open={showSkillGraph} onClose={() => setShowSkillGraph(false)} />
     </div>

@@ -4,6 +4,8 @@ import { Student, ClassGroup, EvaluationReport, User } from '../types';
 import { ChildErrorSignature } from './MisconceptionFingerprint';
 import { IcrTwoStageScan } from './IcrTwoStageScan';
 import { BulkIcrScan, BulkChunkResult, BulkOcrResponse } from './BulkIcrScan';
+import { MAX_FLN_LEVEL } from '../data/skillProgressionMap';
+import { alignExtractedQuestions, questionsLikelyMatch } from '../utils/ocrQuestionMatching';
 
 interface IcrScannerProps {
   token: string;
@@ -263,6 +265,13 @@ export const IcrScanner: React.FC<IcrScannerProps> = ({ token, user, onBack }) =
   // pages) can both be scanned without code changes.
   const [scanMode, setScanMode] = useState<'single' | 'bulk'>('single');
   const [pagesPerStudent, setPagesPerStudent] = useState<number>(2);
+  // How many questions ONE student's paper has, applied uniformly to every
+  // chunk in the bulk batch (a batch is normally one class/level, so every
+  // student's paper is the same length). Optional — undefined means no
+  // guardrail is sent and the model free-segments rows, same as before this
+  // field existed. Empty string, not 0, is the "unset" UI state so the field
+  // can be genuinely blank rather than forcing a 0 that gets coerced away.
+  const [bulkExpectedCount, setBulkExpectedCount] = useState<string>('');
   // Result of the latest /api/icr/evaluate-bulk call. One entry per student
   // chunk (pageFrom..pageTo) with the OCR'd answers + extracted student name.
   const [bulkChunkResults, setBulkChunkResults] = useState<BulkChunkResult[] | null>(null);
@@ -306,6 +315,10 @@ export const IcrScanner: React.FC<IcrScannerProps> = ({ token, user, onBack }) =
 
   const [extractedAnswers, setExtractedAnswers] = useState<{ [questionId: string]: string }>({});
   const [originalOcrAnswers, setOriginalOcrAnswers] = useState<{ [questionId: string]: string }>({});
+  // OCR-transcribed question text, keyed by the answer-key question id it was
+  // scanned for. Keyed rather than positional so a reordered/re-sorted question
+  // list can never compare row N against the wrong transcription.
+  const [extractedQuestions, setExtractedQuestions] = useState<Record<string, string>>({});
   const [questions, setQuestions] = useState<Array<{ id: string; question: string; correctAnswer: string; topic?: string }>>([]);
   const [report, setReport] = useState<EvaluationReport | null>(null);
   // Toggle for the "show full report card" panel below the placement
@@ -628,6 +641,7 @@ export const IcrScanner: React.FC<IcrScannerProps> = ({ token, user, onBack }) =
       setQuestions(loadedQuestions);
       setExtractedAnswers(loadedAnswers);
       setOriginalOcrAnswers({});
+      setExtractedQuestions({});
       answerInputRefs.current = [];
       setOcrPreviewData({
         rawOcrText: '[MANUAL ENTRY — no OCR pass performed]',
@@ -654,6 +668,7 @@ export const IcrScanner: React.FC<IcrScannerProps> = ({ token, user, onBack }) =
   const handleTwoStageResult = async (data: {
     success: boolean;
     answers?: Record<string, { value: string; confidence: number; blue_pixels: number }>;
+    extractedQuestions?: string[];
     debug?: { image_size?: [number, number]; blue_pixel_ratio?: number };
     processingTimeMs?: number;
     ocrAnalysis?: { ocrEngine?: string };
@@ -796,6 +811,7 @@ export const IcrScanner: React.FC<IcrScannerProps> = ({ token, user, onBack }) =
     setOcrPreviewData(firstRes.ocrAnalysis);
     setExtractedAnswers(extracted);
     setOriginalOcrAnswers(extracted);
+    setExtractedQuestions(alignExtractedQuestions(loadedQuestions, data.extractedQuestions));
     setQuestions(loadedQuestions);
     setReport({
       id: 'rep_' + Date.now(),
@@ -835,6 +851,10 @@ export const IcrScanner: React.FC<IcrScannerProps> = ({ token, user, onBack }) =
   // in the teacher's batch.
   const handleBulkOcrSuccess = (resp: BulkOcrResponse) => {
     setBulkChunkResults(resp.results || []);
+    // Bulk chunks carry no transcribed question text, so drop any left over
+    // from a previous single-sheet scan — otherwise the verify table would
+    // flag every bulk row against a stale scan's question text.
+    setExtractedQuestions({});
     setBulkMeta({
       totalPages: resp.totalPages,
       totalStudents: resp.totalStudents,
@@ -1177,6 +1197,7 @@ export const IcrScanner: React.FC<IcrScannerProps> = ({ token, user, onBack }) =
 
   const resetScanner = () => {
     setExtractedAnswers({});
+    setExtractedQuestions({});
     setReport(null);
     setBulkResults(null);
     setUploadedFile(null);
@@ -1419,6 +1440,35 @@ export const IcrScanner: React.FC<IcrScannerProps> = ({ token, user, onBack }) =
               </div>
             )}
 
+            {/* Bulk-only: tell the model exactly how many questions ONE
+                student's paper has, so it stops free-segmenting rows.
+                Without this the model can over/under-count rows (e.g.
+                splitting one multi-part question into two), which then
+                fails to match the student's real answer key at submit
+                time. Optional — leave blank to skip the guard. */}
+            {scanMode === 'bulk' && (
+              <div>
+                <label className="block text-xs font-mono font-bold text-zinc-500 dark:text-zinc-400 uppercase mb-1.5">
+                  Expected Questions Per Student (optional)
+                </label>
+                <div className="flex items-center gap-3">
+                  <input
+                    type="number"
+                    min={1}
+                    max={200}
+                    value={bulkExpectedCount}
+                    onChange={(e) => setBulkExpectedCount(e.target.value)}
+                    placeholder="e.g. 10"
+                    className="w-24 text-sm border border-zinc-200 dark:border-zinc-700 rounded-lg p-2.5 bg-white dark:bg-slate-800 text-zinc-900 dark:text-white focus:border-zinc-500 outline-none"
+                  />
+                  <span className="text-xs text-zinc-500 dark:text-zinc-400 font-mono leading-relaxed">
+                    How many questions ONE student's paper has (all students in this batch
+                    must have the same-length paper). Leave blank to skip this check.
+                  </span>
+                </div>
+              </div>
+            )}
+
             {/* Answer Sheet Upload — hidden in bulk mode because BulkIcrScan
                 owns its own upload UX (the bulk flow is upload-then-run, not
                 upload-then-pick-student). The single-sheet flow keeps the
@@ -1484,6 +1534,10 @@ export const IcrScanner: React.FC<IcrScannerProps> = ({ token, user, onBack }) =
                   token={token}
                   uploadedFile={uploadedFile}
                   pagesPerStudent={pagesPerStudent}
+                  expectedCount={(() => {
+                    const n = parseInt(bulkExpectedCount, 10);
+                    return Number.isFinite(n) && n > 0 ? n : undefined;
+                  })()}
                   onBulkOcrSuccess={handleBulkOcrSuccess}
                 />
               </div>
@@ -1654,7 +1708,8 @@ export const IcrScanner: React.FC<IcrScannerProps> = ({ token, user, onBack }) =
                 <table className="w-full text-left text-xs">
                   <thead>
                     <tr className="bg-zinc-50 dark:bg-zinc-800 border-b border-zinc-200 dark:border-zinc-700 text-zinc-500 dark:text-zinc-400 font-mono uppercase">
-                      <th className="p-3"># Item Number</th>
+                      <th className="p-3 w-20">#</th>
+                      <th className="p-3">Known Question</th>
                       <th className="p-3">Student's Response on Paper (OCR / Edit ✏️)</th>
                       <th className="p-3 text-center">Extraction Status</th>
                     </tr>
@@ -1664,11 +1719,30 @@ export const IcrScanner: React.FC<IcrScannerProps> = ({ token, user, onBack }) =
                       if (!q) return null;
                       const userVal = extractedAnswers[q.id] || '';
                       const origVal = originalOcrAnswers[q.id] || '';
+                      const extractedQuestion = extractedQuestions[q.id] ?? '';
+                      const questionMismatch = extractedQuestion.trim().length > 0
+                        && !questionsLikelyMatch(extractedQuestion, q.question);
                       const isTeacherEdited = userVal !== origVal;
                       return (
-                        <tr key={q.id || idx} className="hover:bg-zinc-50/50 dark:hover:bg-zinc-800/40">
-                          <td className="p-3 font-medium text-zinc-900 dark:text-white">
-                            <span className="font-mono text-[10px] font-bold text-zinc-400 mr-1.5">Item #{idx + 1}</span>
+                        <tr key={q.id || idx} className={questionMismatch
+                          ? 'bg-amber-50/60 dark:bg-amber-950/20'
+                          : 'hover:bg-zinc-50/50 dark:hover:bg-zinc-800/40'}>
+                          <td className="p-3 font-mono text-[10px] font-bold text-zinc-500 dark:text-zinc-400">
+                            {idx + 1}
+                          </td>
+                          <td className="p-3 align-top">
+                            <div className="font-medium text-zinc-900 dark:text-white break-words">
+                              {q.question}
+                            </div>
+                            {questionMismatch && (
+                              <div
+                                role="alert"
+                                className="mt-2 rounded-lg border border-amber-300 bg-amber-50 px-2.5 py-2 text-amber-900 dark:border-amber-800 dark:bg-amber-950/50 dark:text-amber-200"
+                              >
+                                <div className="text-[10px] font-mono font-bold uppercase">Possible row mismatch</div>
+                                <div className="mt-1 break-words text-xs">Model saw: {extractedQuestion}</div>
+                              </div>
+                            )}
                           </td>
                           <td className="p-3">
                             <div className="relative">
@@ -2132,7 +2206,7 @@ export const IcrScanner: React.FC<IcrScannerProps> = ({ token, user, onBack }) =
                 <div className="text-xs font-mono opacity-90">
                   {report.recommendedSubLevel === 2 ? 'Remedial'
                     : report.recommendedSubLevel === 1 ? 'Easier'
-                    : 'Mastery'} · target L{Math.min(93, (report.recommendedLevel ?? 1) + 1)}
+                    : 'Mastery'} · target L{Math.min(MAX_FLN_LEVEL, (report.recommendedLevel ?? 1) + 1)}
                 </div>
               </div>
 

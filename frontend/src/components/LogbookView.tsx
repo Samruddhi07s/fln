@@ -2,10 +2,25 @@ import { apiFetch } from '../services/apiClient';
 import React, { useState, useEffect } from 'react';
 import { LogEntry, UserRole, User, School } from '../types';
 import { Download, Search, SlidersHorizontal } from 'lucide-react';
+import { buildCsv, downloadCsv } from '../utils/csv';
 
 interface LogbookViewProps {
   token: string;
   user?: User | null;
+}
+
+export function extractLogbookRows(logs: LogEntry[]): (string | number)[][] {
+  return logs.map(l => [
+    new Date(l.timestamp).toISOString(),
+    l.id,
+    l.userEmail,
+    l.userRole,
+    l.schoolId || 'National',
+    l.schoolName || 'National Framework',
+    l.activityType,
+    l.status,
+    l.details,
+  ]);
 }
 
 export const LogbookView: React.FC<LogbookViewProps> = ({ token, user }) => {
@@ -123,29 +138,8 @@ export const LogbookView: React.FC<LogbookViewProps> = ({ token, user }) => {
     if (filteredLogs.length === 0) return;
     
     const headers = ['Timestamp', 'Log ID', 'User Email', 'User Role', 'Location School ID', 'Location School Name', 'Activity', 'Status', 'Details'];
-    
-    const rows = filteredLogs.map(l => [
-      new Date(l.timestamp).toISOString(),
-      l.id,
-      l.userEmail,
-      l.userRole,
-      l.schoolId || 'National',
-      l.schoolName || 'National Framework',
-      l.activityType,
-      l.status,
-      `"${l.details.replace(/"/g, '""')}"`
-    ]);
-    
-    const csvContent = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
-    
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.setAttribute('download', `FLN_System_Logbook_Export_${new Date().toISOString().split('T')[0]}.csv`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+    const rows = extractLogbookRows(filteredLogs);
+    downloadCsv(`FLN_System_Logbook_Export_${new Date().toISOString().split('T')[0]}.csv`, buildCsv(headers, rows));
   };
 
   // Check locks for selectors based on user roles
@@ -182,7 +176,7 @@ export const LogbookView: React.FC<LogbookViewProps> = ({ token, user }) => {
           {/* 1. State Filter */}
           <div>
             <label className="block text-[10px] font-mono font-bold text-zinc-400 dark:text-zinc-500 uppercase tracking-wider mb-1">State Scope</label>
-            <select
+            <select aria-label="State Scope"
               value={selectedState}
               onChange={(e) => {
                 setSelectedState(e.target.value);
@@ -203,7 +197,7 @@ export const LogbookView: React.FC<LogbookViewProps> = ({ token, user }) => {
           {/* 2. District Filter */}
           <div>
             <label className="block text-[10px] font-mono font-bold text-zinc-400 dark:text-zinc-500 uppercase tracking-wider mb-1">District Scope</label>
-            <select
+            <select aria-label="District Scope"
               value={selectedDistrict}
               onChange={(e) => {
                 setSelectedDistrict(e.target.value);
@@ -223,7 +217,7 @@ export const LogbookView: React.FC<LogbookViewProps> = ({ token, user }) => {
           {/* 3. Block Filter */}
           <div>
             <label className="block text-[10px] font-mono font-bold text-zinc-400 dark:text-zinc-500 uppercase tracking-wider mb-1">Block Scope</label>
-            <select
+            <select aria-label="Block Scope"
               value={selectedBlock}
               onChange={(e) => {
                 setSelectedBlock(e.target.value);
@@ -242,7 +236,7 @@ export const LogbookView: React.FC<LogbookViewProps> = ({ token, user }) => {
           {/* 4. School Filter */}
           <div>
             <label className="block text-[10px] font-mono font-bold text-zinc-400 dark:text-zinc-500 uppercase tracking-wider mb-1">School Facility</label>
-            <select
+            <select aria-label="School Facility"
               value={selectedSchool}
               onChange={(e) => setSelectedSchool(e.target.value)}
               className="w-full border border-zinc-200 dark:border-zinc-700 rounded-lg p-2.5 bg-zinc-50 dark:bg-zinc-800 focus:border-zinc-500 focus:bg-white dark:focus:bg-slate-800 outline-none font-medium text-zinc-900 dark:text-white"
@@ -257,7 +251,7 @@ export const LogbookView: React.FC<LogbookViewProps> = ({ token, user }) => {
           {/* 5. Log Type Filter */}
           <div>
             <label className="block text-[10px] font-mono font-bold text-zinc-400 dark:text-zinc-500 uppercase tracking-wider mb-1">Activity Category</label>
-            <select
+            <select aria-label="Activity Category"
               value={filterType}
               onChange={(e) => setFilterType(e.target.value)}
               className="w-full border border-zinc-200 dark:border-zinc-700 rounded-lg p-2.5 bg-zinc-50 dark:bg-zinc-800 focus:border-zinc-500 focus:bg-white dark:focus:bg-slate-800 outline-none font-medium text-zinc-900 dark:text-white"
